@@ -5,3 +5,6 @@ reference.flac
 output.flac
 debug.txt
 flac-enc
+
+# Whitelist
+!/cmd/flac-enc/main.ha
