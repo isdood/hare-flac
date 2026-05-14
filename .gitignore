@@ -1,0 +1,7 @@
+# Specifically ignore direnv's internal state (just in case)
+.direnv/
+
+reference.flac
+output.flac
+debug.txt
+flac-enc
