@@ -13,14 +13,17 @@ export fn optimize_rice(res: []i32) u8 = {
     if (len(res) == 0) return 0;
     let sum = 0u64;
     for (let i = 0z; i < len(res); i += 1) {
-        const u = zig_zag(res[i]);
-        sum += u: u64;
+        sum += zig_zag(res[i]): u64;
     };
     const avg = sum: f64 / len(res): f64;
     if (avg <= 0.0) return 0;
 
-    // Heuristic: log2(avg * 0.69)
     let s = (math::log2f64(avg * 0.6931) + 0.5): i32;
+
+    // SAFETY VALVE: If the average residual is huge,
+    // we MUST use a larger s to keep the quotient 'q' small.
+    if (avg > 1024.0 && s < 10) s = 10;
+
     if (s < 0) s = 0;
     if (s > 14) s = 14;
     return s: u8;
@@ -31,18 +34,19 @@ export fn write_rice(w: *bit_writer, val: i32, s: u8) (size | io::error) = {
     const q = u >> s;
     const r = u & ((1u32 << s) - 1);
 
+    // FLAC decoders typically allow q up to 31.
+    // Anything higher is a "Unary Explosion".
+    const safe_q = if (q > 31) 31u32 else q;
+
     let bits = 0z;
-    // Unary part: q zeros followed by a one
-    for (let i = 0u32; i < q; i += 1) {
+    for (let i = 0u32; i < safe_q; i += 1) {
         bits += write_bits(w, 0, 1)?;
     };
     bits += write_bits(w, 1, 1)?;
 
-    // Binary part: s bits
     if (s > 0) {
         bits += write_bits(w, r: u64, s)?;
     };
-
     return bits;
 };
 

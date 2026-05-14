@@ -6,6 +6,9 @@ use wav;
 use lpc;
 use flac;
 
+// Use def for compile-time constants to satisfy array dimension requirements
+def MAX_BLOCK: size = 4096;
+
 export fn main() void = {
     const args = os::args;
     if (len(args) < 3) {
@@ -39,25 +42,35 @@ export fn main() void = {
     let writer = flac::newwriter(out_file);
     flac::write_stream_header(&writer, &dec)!;
 
-    let raw_samples: [8192]i32 = [0...];
-    let left: [4096]i32 = [0...];
-    let right: [4096]i32 = [0...];
+    const channels = dec.meta.channels: size;
+
+    // Use the def-based constant for fixed-size array allocation
+    let raw_samples: [MAX_BLOCK * 2]i32 = [0...];
+    let left: [MAX_BLOCK]i32 = [0...];
+    let right: [MAX_BLOCK]i32 = [0...];
     let frame_count = 0u32;
 
     for (true) {
-        const n = match (wav::read_samples(&stream, raw_samples)) {
+        // Explicitly slice the buffer based on the actual channel count
+        // to prevent reading into unallocated space or causing alignment shifts
+        const buffer_slice = raw_samples[..MAX_BLOCK * channels];
+        const n = match (wav::read_samples(&stream, buffer_slice)) {
         case let s: size =>
             if (s == 0) break else yield s;
         case let e: wav::error => break;
         };
 
         flac::reset_crc16(&writer);
-        const block_size = (n / dec.meta.channels: size): u16;
+
+        const block_size = (n / channels): u16;
         const bps = dec.meta.bit_depth: u8;
 
+        // De-interleave: ensure we only iterate up to the samples actually read
         for (let i = 0z; i < block_size: size; i += 1) {
-            left[i] = raw_samples[i * 2];
-            right[i] = raw_samples[i * 2 + 1];
+            left[i] = raw_samples[i * channels];
+            if (channels > 1) {
+                right[i] = raw_samples[i * channels + 1];
+            };
         };
 
         flac::write_frame_header(
@@ -69,8 +82,13 @@ export fn main() void = {
             frame_count
         )!;
 
+        // Encode each channel. If mono, only the left subframe is written.
         const left_bits = encode_channel(&writer, left[..block_size], bps)!;
-        const right_bits = encode_channel(&writer, right[..block_size], bps)!;
+        const right_bits = if (channels > 1) {
+            yield encode_channel(&writer, right[..block_size], bps)!;
+        } else {
+            yield 0z;
+        };
 
         if (frame_count < 3) {
             fmt::printfln("Frame {}: left={} bits, right={} bits, total={} bits",

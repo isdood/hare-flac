@@ -44,31 +44,12 @@ export fn write_bits(w: *bit_writer, value: u64, count: u8) (size | io::error) =
     return total_written;
 };
 
-export fn finalize_frame(w: *bit_writer) u16 = {
-    const final_crc = w.crc16;
-    if (w.bits_used > 0) {
-        // Shift bits to align to the MSB of the byte
-        w.buffer <<= (8 - w.bits_used);
-
-        // CRITICAL: Do NOT update w.crc16 or w.crc8 here.
-        // Padding bits are NOT part of the CRC calculation in FLAC.
-
-        const b = [w.buffer];
-        io::write(w.handle, b)!;
-        w.buffer = 0;
-        w.bits_used = 0;
-    };
-    return final_crc;
-};
-
+// A standard flush for subframes or entropy coding.
+// Aligns to the next byte boundary using MSB-padding.
+// Does NOT update CRCs (padding bits are excluded from FLAC CRCs).
 export fn flush(w: *bit_writer) (size | io::error) = {
     if (w.bits_used > 0) {
-        // Shift remaining bits to the MSB as required by FLAC padding
         const final_byte = w.buffer << (8 - w.bits_used);
-
-        // DO NOT update w.crc8 or w.crc16 here.
-        // Padding bits are not part of the FLAC CRC calculation.
-
         const b: [1]u8 = [final_byte];
         const n = io::write(w.handle, b)?;
         w.buffer = 0;
@@ -76,6 +57,44 @@ export fn flush(w: *bit_writer) (size | io::error) = {
         return n;
     };
     return 0z;
+};
+
+// Specialized flush for the Frame Header.
+// FLAC requires the Frame Header CRC-8 to cover the ENTIRE header.
+// If the header ends on a partial byte, that byte MUST be in the CRC.
+export fn flush_header(w: *bit_writer) (size | io::error) = {
+    if (w.bits_used > 0) {
+        w.buffer <<= (8 - w.bits_used);
+
+        // FIX: The padded final byte of the header MUST be in CRC-8
+        w.crc8 = crc8_update(w.crc8, w.buffer);
+
+        const b: [1]u8 = [w.buffer];
+        const n = io::write(w.handle, b)?;
+        w.buffer = 0;
+        w.bits_used = 0;
+        return n;
+    };
+    return 0z;
+};
+
+// Finalizes the entire frame.
+// Similar to flush_header, the final byte must be included in the CRC-16.
+export fn finalize_frame(w: *bit_writer) u16 = {
+    const final_crc = w.crc16;
+    if (w.bits_used > 0) {
+        w.buffer <<= (8 - w.bits_used);
+
+        // FIX: The final byte of the frame MUST be included in CRC-16
+        w.crc16 = crc16_update(w.crc16, w.buffer);
+
+        const b: [1]u8 = [w.buffer];
+        io::write(w.handle, b)!;
+        w.buffer = 0;
+        w.bits_used = 0;
+        return w.crc16;
+    };
+    return final_crc;
 };
 
 export fn reset_crc8(w: *bit_writer) void = { w.crc8 = 0; };
@@ -90,6 +109,8 @@ export fn reset_crc16(w: *bit_writer) void = { w.crc16 = 0; };
     write_bits(&w, 0b0001, 4)!;
 
     write_bits(&w, 0b1, 1)!;
+
+    // FIX: Remove 'flac::' because we are already inside the flac package
     flush(&w)!;
 
     assert(buf[0] == 0xb1);

@@ -5,9 +5,11 @@
 reference.flac
 output.flac
 test.flac
+sine.wav
 
 # Debug files
-issues.md
+issues-1.md
+issues-2.md
 notes.md
 debug.txt
 
