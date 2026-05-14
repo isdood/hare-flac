@@ -1,8 +1,14 @@
 # Specifically ignore direnv's internal state (just in case)
 .direnv/
 
+# Test audio
 reference.flac
 output.flac
+test.flac
+
+# Debug files
+issues.md
+notes.md
 debug.txt
 
 # Root-level binary
