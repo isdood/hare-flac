@@ -35,39 +35,37 @@ export fn write_frame_header(
     let total_bits = 0z;
     reset_crc8(w);
 
-    // 1. Sync (14 bits: 11111111 111110) + Reserved (0) + Blocking (0 = Fixed)
+    // 1. Sync + Reserved + Blocking (0 = Fixed)
     total_bits += write_bits(w, 0x3FFE, 14)?;
     total_bits += write_bits(w, 0, 2)?;
 
-    // 2. Block size code (4 bits)
-    // 0b1100 is 4096. You should eventually map 'block_size' to this code.
-    total_bits += write_bits(w, 0b1100, 4)?;
+    // 2. Block size code
+    // Use 0b1100 for 4096, otherwise use 0b0111 for a 16-bit literal
+    const bs_code = if (block_size == 4096) 0b1100u64 else 0b0111u64;
+    total_bits += write_bits(w, bs_code, 4)?;
 
-    // 3. Sample rate code (4 bits)
-    // 0b1001 is 44.1kHz.
+    // 3. Sample rate code (keep 0b1001 for 44.1kHz or map dynamically)
     total_bits += write_bits(w, 0b1001, 4)?;
 
-    // 4. Channel Assignment (4 bits)
+    // 4. Channel Assignment
     const chan_code = if (channels == 2) 0b0001u64 else 0b0000u64;
     total_bits += write_bits(w, chan_code, 4)?;
 
-    // 5. Sample Size (3 bits) + Reserved (1 bit)
+    // 5. Sample Size + Reserved
     const sz_code = if (bps == 16) 0b100u64 else 0b110u64;
     total_bits += write_bits(w, sz_code, 3)?;
     total_bits += write_bits(w, 0, 1)?;
 
     // 6. Frame Number
-    // According to FLAC spec, for fixed blocking (strategy 0),
-    // this field contains the frame number, not the sample number.
     total_bits += write_utf8_int(w, frame_num: u64)?;
 
-    // 7. CRC-8 Calculation
-    // CRITICAL: The CRC-8 is calculated over everything from the Sync to
-    // the end of the Frame/Sample number. We must ensure the bit_writer
-    // has processed these bits into bytes before calculating.
+    if (bs_code == 0b0111) {
+        total_bits += write_bits(w, (block_size - 1): u64, 16)?;
+    };
 
-    // Most encoders flush to a byte boundary here if not already aligned.
-    // We capture the CRC-8 accumulated by the writer.
+    // 7. CRC-8 Calculation
+    // Safety: Flush the header to ensure the final bits are in the CRC
+    flush_header(w)?;
     const header_crc = w.crc8;
 
     // 8. Write the 8-bit CRC-8
