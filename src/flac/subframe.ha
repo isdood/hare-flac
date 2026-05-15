@@ -46,7 +46,22 @@ export fn write_subframe_lpc(
 
 	// Use FIXED order 1 if it produces lower residuals
 	if (fixed_sum < lpc_sum) {
-		return write_subframe_fixed1(w, samples, bps);
+		// Subframe header: FIXED order 1 = type 0b001001, header = 0 | 001001 | 0 = 0x12
+		let total_bits = 0z;
+		total_bits += write_bits(w, 0x12, 8)?;
+
+		// One warm-up sample
+		total_bits += write_bits(w, (samples[0]: u64) & ((1u64 << bps) - 1), bps)?;
+
+		// Compute and write residuals
+		let res_buf: [4096]i32 = [0...];
+		for (let i = 1z; i < n; i += 1) {
+			res_buf[i] = samples[i] - samples[i - 1];
+		};
+
+		total_bits += write_residuals(w, res_buf[1..n], 1)?;
+
+		return total_bits;
 	};
 
 	// Otherwise use LPC
@@ -69,32 +84,6 @@ export fn write_subframe_lpc(
 	};
 
 	total_bits += write_residuals(w, lpc_res[p..], order)?;
-
-	return total_bits;
-};
-
-// FIXED order 1: prediction is previous sample, residual = sample[i] - sample[i-1]
-fn write_subframe_fixed1(
-	w: *bit_writer,
-	samples: []i32,
-	bps: u8,
-) (size | io::error) = {
-	const n = len(samples);
-	let total_bits = 0z;
-
-	// Subframe header: FIXED order 1 = type 0b001001, header = 0 | 001001 | 0 = 0x12
-	total_bits += write_bits(w, 0x12, 8)?;
-
-	// One warm-up sample
-	total_bits += write_bits(w, (samples[0]: u64) & ((1u64 << bps) - 1), bps)?;
-
-	// Compute and write residuals
-	let res_buf: [4096]i32 = [0...];
-	for (let i = 1z; i < n; i += 1) {
-		res_buf[i] = samples[i] - samples[i - 1];
-	};
-
-	total_bits += write_residuals(w, res_buf[1..n], 1)?;
 
 	return total_bits;
 };
