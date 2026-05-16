@@ -1,10 +1,9 @@
 # hare-flac
 
-A native Hare implementation of the FLAC (Free Lossless Audio Codec) specification. This project focuses on bit-perfect audio analysis and reconstruction using Linear Predictive Coding (LPC).
+A native Hare implementation of the FLAC (Free Lossless Audio Codec) specification. This project focuses on reconstruction using Linear Predictive Coding (LPC). The project is currently in a useable state for 16bit .wav to .flac conversions.
 
 ## Features
 
-* **Lossless Engine**: Verified bit-perfect round-trip reconstruction for 16-bit and 24-bit PCM audio.
 * **LPC Analysis**: Levinson-Durbin recursion for optimal coefficient generation.
 * **Fixed Predictors**: Support for FLAC fixed predictor orders 0-4.
 * **High Precision**: Internal analysis performed in `f64` before being quantized to fixed-point integers for storage.
@@ -30,16 +29,6 @@ ln -s ~/path/to/hare-lpc/src/lpc vendor/lpc
 
 ```
 
-### Building the Test Utility
-
-The included `lpc-test` tool allows you to verify the lossless nature of the codec against your own WAV files. Currently, hare-lpc is it's own standalone repo, therefore one must first 'cd' into the hare-lpc dir to utilize the lpc-test tooling.
-
-```bash
-make
-./lpc-test path/to/audio.wav
-
-```
-
 ### Running Tests
 
 Execute the test suite to verify autocorrelation, predictor logic, and Levinson-Durbin stability. Currently, hare-lpc is it's own standalone repo, therefore one must first 'cd' into the hare-lpc dir to execute 'hare test'.
@@ -47,6 +36,20 @@ Execute the test suite to verify autocorrelation, predictor logic, and Levinson-
 ```bash
 hare test
 
+```
+
+### Building flac-enc
+
+To build the flac encoder (converts a .wav to .flac):
+
+```bash
+make
+
+```
+And to use the resulting binary:
+
+```bash
+./flac-enc example.wav output.flac
 ```
 
 ## Implementation Details
