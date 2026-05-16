@@ -34,16 +34,16 @@ export fn write_rice(w: *bit_writer, val: i32, s: u8) (size | io::error) = {
     const q = u >> s;
     const r = u & ((1u32 << s) - 1);
 
-    // FLAC decoders typically allow q up to 31.
-    // Anything higher is a "Unary Explosion".
-    const safe_q = if (q > 31) 31u32 else q;
+    // FLAC hard limit: max 30 unary zeros (q <= 30)
+    // Callers must ensure this via rice_k selection or verbatim fallback.
+    // Panic here rather than silently corrupt output.
+    assert(q <= 30, "Rice quotient overflow — caller must use higher rice_k or verbatim");
 
     let bits = 0z;
-    for (let i = 0u32; i < safe_q; i += 1) {
+    for (let i = 0u32; i < q; i += 1) {
         bits += write_bits(w, 0, 1)?;
     };
     bits += write_bits(w, 1, 1)?;
-
     if (s > 0) {
         bits += write_bits(w, r: u64, s)?;
     };
