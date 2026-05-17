@@ -51,6 +51,8 @@ And to use the resulting binary:
 ```bash
 ./flac-enc example.wav output.flac
 ```
+... note this is expecting use of the provided Nix derivation which creates the proper environment & sets the required $HAREPATH. If you don't plan on using Nix for environment management, ensure your $HAREPATH is properly set to include the stdlib, src dir and vendor dir.
+
 
 ## Implementation Details
 
