@@ -31,7 +31,7 @@ ln -s ~/path/to/hare-lpc/src/lpc vendor/lpc
 
 ### Running Tests
 
-Execute the test suite to verify autocorrelation, predictor logic, and Levinson-Durbin stability. Currently, hare-lpc is it's own standalone repo, therefore one must first 'cd' into the hare-lpc dir to execute 'hare test'.
+Execute the test suite to verify autocorrelation, predictor logic, and Levinson-Durbin stability. The repo is still under construction, therefore the test suite should be expected to change drastically & may not currently cover enough:
 
 ```bash
 hare test
