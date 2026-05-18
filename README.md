@@ -1,6 +1,6 @@
 # hare-flac
 
-A native Hare implementation of the FLAC (Free Lossless Audio Codec) specification. This project focuses on reconstruction using Linear Predictive Coding (LPC). The project is currently in a useable state for 16bit .wav to .flac conversions - ONLY 44100 Hz at the moment, I've encountered bugs in need of resolving for anything else (ie. 96000 Hz).
+A native Hare implementation of the FLAC (Free Lossless Audio Codec) specification. This project focuses on reconstruction using Linear Predictive Coding (LPC). The project is currently in a useable state for 16bit .wav to .flac conversions - I haven't tested 24bit. Supports various sample rates.
 
 ## Features
 
@@ -63,4 +63,3 @@ The codec follows the standard FLAC analysis flow:
 3. **Recursion**: Solving Yule-Walker equations via Levinson-Durbin.
 4. **Quantization**: Converting optimal coefficients to 12-15 bit integers.
 5. **Residual Calculation**: Generating the difference signal via integer-domain prediction.
-

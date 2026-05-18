@@ -44,8 +44,22 @@ export fn write_frame_header(
     const bs_code = if (block_size == 4096) 0b1100u64 else 0b0111u64;
     total_bits += write_bits(w, bs_code, 4)?;
 
-    // 3. Sample rate code (keep 0b1001 for 44.1kHz or map dynamically)
-    total_bits += write_bits(w, 0b1001, 4)?;
+    // 3. Sample rate code (dynamic now)
+    const sr_code: u64 = switch (sample_rate) {
+        case 8000  => yield 0b0100;
+        case 16000 => yield 0b0101;
+        case 22050 => yield 0b0110;
+        case 24000 => yield 0b0111;
+        case 32000 => yield 0b1000;
+        case 44100 => yield 0b1001;
+        case 48000 => yield 0b1010;
+        case 96000 => yield 0b1011;
+        case 88200 => yield 0b0001;
+        case 176400 => yield 0b0010;
+        case 192000 => yield 0b0011;
+        case       => yield 0b1100; // get 8-bit kHz literal
+    };
+    total_bits += write_bits(w, sr_code, 4)?;
 
     // 4. Channel Assignment
     const chan_code = if (channels == 2) 0b0001u64 else 0b0000u64;
