@@ -90,9 +90,8 @@ export fn main() void = {
             yield 0z;
         };
 
-        if (frame_count < 3) {
-            fmt::printfln("Frame {}: left={} bits, right={} bits, total={} bits",
-                          frame_count, left_bits, right_bits, left_bits + right_bits)!;
+        if (frame_count < 1) {
+            fmt::printfln("Encoding audio...")!;
         };
 
         const frame_crc = flac::finalize_frame(&writer);
