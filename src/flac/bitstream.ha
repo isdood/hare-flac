@@ -1,13 +1,23 @@
 use io;
 use memio;
 
+// Output buffer size for the bit_writer. Bytes are accumulated here and
+// flushed to the underlying handle in bulk, eliminating per-byte syscalls.
+def OUTBUF_SIZE: size = 65536;
+
 // A bit-oriented writer that wraps a standard io::handle.
 export type bit_writer = struct {
     handle: io::handle,
+    // Partial-byte accumulator. Bits are packed MSB-first into the low bits
+    // of this field. Only the low `bits_used` bits are valid.
     buffer: u8,
     bits_used: u8,
-    crc8: u8,   // Track CRC-8 for headers
-    crc16: u16,  // Track CRC-16 for frames
+    crc8: u8,
+    crc16: u16,
+    // Output buffer: complete bytes accumulate here before being flushed
+    // to `handle` in a single bulk write.
+    outbuf: [OUTBUF_SIZE]u8,
+    outbuf_len: size,
 };
 
 // Initializes a new bit_writer.
@@ -18,29 +28,67 @@ export fn newwriter(h: io::handle) bit_writer = {
         bits_used = 0,
         crc8 = 0,
         crc16 = 0,
+        outbuf = [0...],
+        outbuf_len = 0,
     };
 };
 
-// Writes up to 64 bits from a value.
-export fn write_bits(w: *bit_writer, value: u64, count: u8) (size | io::error) = {
-    let total_written = 0z;
-    for (let i = 0u8; i < count; i += 1) {
-        const bit_idx = count - i - 1;
-        const bit = ((value >> bit_idx) & 1): u8;
+// Drains the output buffer to the underlying handle.
+fn flush_outbuf(w: *bit_writer) (void | io::error) = {
+    if (w.outbuf_len == 0) return;
+    io::write(w.handle, w.outbuf[..w.outbuf_len])?;
+    w.outbuf_len = 0;
+};
 
-        w.buffer = (w.buffer << 1) | bit;
-        w.bits_used += 1;
-        if (w.bits_used == 8) {
-            w.crc8 = crc8_update(w.crc8, w.buffer);
-            w.crc16 = crc16_update(w.crc16, w.buffer);
-
-            const b: [1]u8 = [w.buffer];
-            total_written += io::write(w.handle, b)?;
-            w.buffer = 0;
-            w.bits_used = 0;
-        };
+// Appends a complete byte to the output buffer, flushing to the handle
+// first if the buffer is full. Updates CRC state.
+fn emit_byte(w: *bit_writer, b: u8) (void | io::error) = {
+    w.crc8 = crc8_update(w.crc8, b);
+    w.crc16 = crc16_update(w.crc16, b);
+    w.outbuf[w.outbuf_len] = b;
+    w.outbuf_len += 1;
+    if (w.outbuf_len == OUTBUF_SIZE) {
+        flush_outbuf(w)?;
     };
-    return total_written;
+};
+
+// Writes up to 64 bits from a value, MSB first.
+//
+// Strategy: rather than looping bit-by-bit, use a 16-bit staging word.
+// The existing partial byte sits in the high bits of `word`, and the new
+// `count` bits are shifted in below it. Then, drain complete bytes from
+// the top of `word` one at a time, leaving any partial remainder for the
+// next call.
+export fn write_bits(w: *bit_writer, value: u64, count: u8) (size | io::error) = {
+    if (count == 0) return 0z;
+
+    // Build a 16-bit staging word:
+    //   [ existing bits_used partial bits | incoming count bits | padding ]
+    // Shift `value` up so the new bits are MSB-aligned within the
+    // remaining space, then merge with the partial byte already in `buffer`.
+    let total_bits = w.bits_used + count;
+
+    // Pack everything into a u64 working register.
+    // Place `buffer` at the top, then the new bits immediately below.
+    let word: u64 = (w.buffer: u64 << (count: u64))
+                  | (value & ((1u64 << count) - 1));
+
+    // `total_bits` is the number of valid bits in `word` starting from bit
+    // (total_bits - 1) down to bit 0. Drain complete bytes from the MSB end.
+    let bytes_written = 0z;
+    for (total_bits >= 8) {
+        total_bits -= 8;
+        const byte = ((word >> total_bits) & 0xFF): u8;
+        emit_byte(w, byte)?;
+        bytes_written += 1;
+    };
+
+    // Store any remaining partial bits back into buffer.
+    // `total_bits` is now 0..7.
+    w.bits_used = total_bits;
+    w.buffer = if (total_bits > 0) (word & ((1u64 << total_bits) - 1)): u8 else 0u8;
+
+    return bytes_written;
 };
 
 // Writes 'count' zero bits efficiently. Optimized for unary Rice coding.
@@ -49,48 +97,33 @@ export fn write_zeros(w: *bit_writer, count: u32) (size | io::error) = {
     let total_written = 0z;
     let remaining_bits = count;
 
-    // Phase 1: Clear out any unaligned pending bits in the buffer
+    // Phase 1: Fill out the partial byte if one is in progress.
     if (w.bits_used > 0) {
-        const bits_to_fill = 8 - w.bits_used;
-        if (remaining_bits < bits_to_fill: u32) {
-            // Not enough zeros to finish the byte; just shift them in
+        const bits_to_fill = (8 - w.bits_used): u32;
+        if (remaining_bits < bits_to_fill) {
             w.buffer <<= remaining_bits: u8;
             w.bits_used += remaining_bits: u8;
             return 0z;
         };
-
-        w.buffer <<= bits_to_fill;
-        w.crc8 = crc8_update(w.crc8, w.buffer);
-        w.crc16 = crc16_update(w.crc16, w.buffer);
-
-        const b: [1]u8 = [w.buffer];
-        total_written += io::write(w.handle, b)?;
+        w.buffer <<= bits_to_fill: u8;
+        emit_byte(w, w.buffer)?;
+        total_written += 1;
         w.buffer = 0;
         w.bits_used = 0;
-        remaining_bits -= bits_to_fill: u32;
+        remaining_bits -= bits_to_fill;
     };
 
-    // Phase 2: Write bulk zero bytes directly to the handle
+    // Phase 2: Emit whole zero bytes directly.
     const zero_bytes = remaining_bits / 8;
     if (zero_bytes > 0) {
-        let zeros_buf: [512]u8 = [0...];
-        let bytes_left = zero_bytes: size;
-
-        for (bytes_left > 0) {
-            const chunk = if (bytes_left < len(zeros_buf)) bytes_left else len(zeros_buf);
-
-            for (let i = 0z; i < chunk; i += 1) {
-                w.crc8 = crc8_update(w.crc8, 0);
-                w.crc16 = crc16_update(w.crc16, 0);
-            };
-
-            total_written += io::write(w.handle, zeros_buf[..chunk])?;
-            bytes_left -= chunk;
+        for (let i = 0u32; i < zero_bytes; i += 1) {
+            emit_byte(w, 0)?;
+            total_written += 1;
         };
         remaining_bits %= 8;
     };
 
-    // Phase 3: Queue up any leftover bits (0 to 7)
+    // Phase 3: Queue any leftover bits (0–7) into the partial buffer.
     if (remaining_bits > 0) {
         w.buffer = 0;
         w.bits_used = remaining_bits: u8;
@@ -99,70 +132,70 @@ export fn write_zeros(w: *bit_writer, count: u32) (size | io::error) = {
     return total_written;
 };
 
-// Writes raw byte blocks directly, automatically managing unaligned pending bits.
+// Writes raw byte blocks directly, managing unaligned pending bits.
 export fn write_bytes(w: *bit_writer, bytes: []u8) (size | io::error) = {
     if (len(bytes) == 0) return 0z;
 
-    // If there are unaligned bits in the buffer, they MUST be cleared first
-    // to maintain sequence integrity before writing raw blocks.
+    // Flush any unaligned partial byte first to maintain bit ordering.
     if (w.bits_used > 0) {
         const final_byte = w.buffer << (8 - w.bits_used);
-        w.crc8 = crc8_update(w.crc8, final_byte);
-        w.crc16 = crc16_update(w.crc16, final_byte);
-        const b: [1]u8 = [final_byte];
-        io::write(w.handle, b)?;
+        emit_byte(w, final_byte)?;
         w.buffer = 0;
         w.bits_used = 0;
     };
 
     for (let i = 0z; i < len(bytes); i += 1) {
-        w.crc8 = crc8_update(w.crc8, bytes[i]);
-        w.crc16 = crc16_update(w.crc16, bytes[i]);
+        emit_byte(w, bytes[i])?;
     };
 
-    return io::write(w.handle, bytes);
+    // Flush the outbuf so callers see their data land.
+    flush_outbuf(w)?;
+    return len(bytes);
 };
 
 // Aligns to the next byte boundary using MSB-padding. Excluded from FLAC CRCs.
+// Flushes the output buffer to the underlying handle.
 export fn flush(w: *bit_writer) (size | io::error) = {
+    let n = 0z;
     if (w.bits_used > 0) {
         const final_byte = w.buffer << (8 - w.bits_used);
-        const b: [1]u8 = [final_byte];
-        const n = io::write(w.handle, b)?;
+        // Note: flush() pads without updating CRCs (per FLAC spec the
+        // padding bits after residuals are not included in any checksum).
+        w.outbuf[w.outbuf_len] = final_byte;
+        w.outbuf_len += 1;
+        n += 1;
         w.buffer = 0;
         w.bits_used = 0;
-        return n;
     };
-    return 0z;
+    flush_outbuf(w)?;
+    return n;
 };
 
 // Specialized flush for the Frame Header. Final byte MUST be in CRC-8.
+// Flushes the output buffer to the underlying handle.
 export fn flush_header(w: *bit_writer) (size | io::error) = {
     if (w.bits_used > 0) {
         w.buffer <<= (8 - w.bits_used);
-        w.crc8 = crc8_update(w.crc8, w.buffer);
-        const b: [1]u8 = [w.buffer];
-        const n = io::write(w.handle, b)?;
+        emit_byte(w, w.buffer)?;
         w.buffer = 0;
         w.bits_used = 0;
-        return n;
     };
+    flush_outbuf(w)?;
     return 0z;
 };
 
-// Finalizes the entire frame. Final byte MUST be included in CRC-16.
+// Finalizes the entire frame. Feeds the last partial byte into CRC-16,
+// writes it, flushes the output buffer, and returns the final CRC-16.
 export fn finalize_frame(w: *bit_writer) u16 = {
-    const final_crc = w.crc16;
     if (w.bits_used > 0) {
         w.buffer <<= (8 - w.bits_used);
-        w.crc16 = crc16_update(w.crc16, w.buffer);
-        const b: [1]u8 = [w.buffer];
-        io::write(w.handle, b)!;
+        // emit_byte updates both CRCs; the final CRC-16 is what's returned.
+        emit_byte(w, w.buffer)!;
         w.buffer = 0;
         w.bits_used = 0;
-        return w.crc16;
     };
-    return final_crc;
+    flush_outbuf(w)!;
+    return w.crc16;
 };
 
 export fn reset_crc8(w: *bit_writer) void = { w.crc8 = 0; };
