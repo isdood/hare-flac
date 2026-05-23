@@ -17,12 +17,38 @@ export fn write_subframe_lpc(
 		return write_subframe_verbatim(w, samples, bps);
 	};
 
-	// Compute LPC residuals
+	// --- 1. Evaluate Fixed Predictors (Orders 0 to 4) ---
+	let best_fixed_order = 0u8;
+	let min_fixed_sum = math::INF;
+	let fixed_res_buf: [4096]i32 = [0...];
+	let best_fixed_res: [4096]i32 = [0...];
+
+	// Safety check: Never evaluate a fixed order higher than the total number of samples.
+	const max_possible_order = if (n < 4) n: u8 else 4u8;
+
+	for (let order = 0u8; order <= max_possible_order; order += 1) {
+		lpc::predict_fixed(samples, order, fixed_res_buf[..n]);
+
+		let current_fixed_sum = 0u64;
+		for (let i = order: size; i < n; i += 1) {
+			const v = fixed_res_buf[i];
+			current_fixed_sum += if (v >= 0) v: u64 else (-(v: i64)): u64;
+		};
+
+		if (current_fixed_sum: f64 < min_fixed_sum) {
+			min_fixed_sum = current_fixed_sum: f64;
+			best_fixed_order = order;
+			for (let i = 0z; i < n; i += 1) {
+				best_fixed_res[i] = fixed_res_buf[i];
+			};
+		};
+	};
+
+	// --- 2. Compute LPC residuals ---
 	let lpc_res_buf: [4096]i32 = [0...];
 	let lpc_res = lpc_res_buf[..n];
 	lpc::predict_lpc(samples, q_lpc, shift, lpc_res);
 
-	// Track if LPC has completely exploded at any single sample (transient)
 	let lpc_exploded = false;
 	let lpc_sum = 0u64;
 	for (let i = p; i < n; i += 1) {
@@ -30,44 +56,14 @@ export fn write_subframe_lpc(
 		const abs_v = if (v >= 0) v: u64 else (-(v: i64)): u64;
 		lpc_sum += abs_v;
 
-		// CRITICAL CIRCUIT BREAKER: If a single residual sample is massive
-		// (e.g., greater than 8192), the LPC filter has failed to model
-		// this drum transient. We flag it to abandon LPC immediately.
 		if (abs_v > 8192) {
 			lpc_exploded = true;
 		};
 	};
 
-	// Compute FIXED order 1 residuals for comparison
-	let fixed_res_buf: [4096]i32 = [0...];
-	fixed_res_buf[0] = samples[0];
-	for (let i = 1z; i < n; i += 1) {
-		fixed_res_buf[i] = samples[i] - samples[i - 1];
-	};
-
-	let fixed_sum = 0u64;
-	for (let i = 1z; i < n; i += 1) {
-		const v = fixed_res_buf[i];
-		fixed_sum += if (v >= 0) v: u64 else (-(v: i64)): u64;
-	};
-
-	// FORCE FIXED ORDER 1 if LPC exploded on a snare/hi-hat transient,
-	// or if Fixed math is globally more efficient.
-	if (lpc_exploded || fixed_sum < lpc_sum) {
-		// Subframe header: FIXED order 1 = type 0b001001, header = 0 | 001001 | 0 = 0x12
-		let total_bits = 0z;
-		total_bits += write_bits(w, 0x12, 8)?;
-		// One warm-up sample
-		total_bits += write_bits(w, (samples[0]: u64) & ((1u64 << bps) - 1), bps)?;
-
-		// Compute and write residuals
-		let res_buf: [4096]i32 = [0...];
-		for (let i = 1z; i < n; i += 1) {
-			res_buf[i] = samples[i] - samples[i - 1];
-		};
-
-		total_bits += write_residuals(w, res_buf[1..n], 1)?;
-		return total_bits;
+	// --- 3. Optimization Selection Barrier ---
+	if (lpc_exploded || min_fixed_sum < lpc_sum: f64) {
+		return write_subframe_fixed(w, samples, best_fixed_res[..n], best_fixed_order, bps);
 	};
 
 	// Otherwise proceed with standard LPC safely
@@ -92,6 +88,31 @@ export fn write_subframe_lpc(
 	return total_bits;
 };
 
+// Writes a FLAC fixed-predictor subframe (Orders 0 - 4)
+fn write_subframe_fixed(
+	w: *bit_writer,
+	samples: []i32,
+	residuals: []i32,
+	order: u8,
+	bps: u8,
+) (size | io::error) = {
+	let total_bits = 0z;
+	const n = len(samples);
+
+	// FLAC Fixed Subframe encoding type bits prefix format: 001000 + order
+	const subframe_type = 0b001000u64 | order: u64;
+	total_bits += write_bits(w, subframe_type << 1, 8)?;
+
+	// Write unencoded "warm-up" samples (matching predictor order length)
+	for (let i = 0z; i < order: size; i += 1) {
+		total_bits += write_bits(w, (samples[i]: u64) & ((1u64 << bps) - 1), bps)?;
+	};
+
+	// Write the residual sequence following the warmup phase
+	total_bits += write_residuals(w, residuals[order..n], order)?;
+	return total_bits;
+};
+
 fn write_subframe_verbatim(
 	w: *bit_writer,
 	samples: []i32,
@@ -111,7 +132,6 @@ fn write_residuals(
 	predictor_order: u8,
 ) (size | io::error) = {
 	let total_bits = 0z;
-
 	total_bits += write_bits(w, 0, 2)?;
 
 	const partition_order: u8 = 0;
@@ -124,7 +144,6 @@ fn write_residuals(
 	};
 
 	let rice_k = optimize_rice(residuals);
-
 	// Ensure max quotient stays within FLAC's hard limit of 30
 	for (max_zz >> rice_k: u32 > 30 && rice_k < 14) {
 		rice_k += 1;
@@ -151,7 +170,6 @@ fn write_residuals(
 
 	const bits = write_subframe_lpc(&w, samples, q_lpc, shift, bps)!;
 	flush(&w)!;
-
 	assert(bits > 0);
-	assert(buf[0] == 0x40 || buf[0] == 0x12);
+	assert(buf[0] == 0x40 || (buf[0] >= 0x10 && buf[0] <= 0x1a));
 };

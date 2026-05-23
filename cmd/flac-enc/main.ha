@@ -5,6 +5,7 @@ use fs;
 use wav;
 use lpc;
 use flac;
+use time;
 
 // Use def for compile-time constants to satisfy array dimension requirements
 def MAX_BLOCK: size = 4096;
@@ -43,12 +44,16 @@ export fn main() void = {
     flac::write_stream_header(&writer, &dec)!;
 
     const channels = dec.meta.channels: size;
-
     // Use the def-based constant for fixed-size array allocation
     let raw_samples: [MAX_BLOCK * 2]i32 = [0...];
     let left: [MAX_BLOCK]i32 = [0...];
     let right: [MAX_BLOCK]i32 = [0...];
     let frame_count = 0u32;
+
+    fmt::printfln("Encoding audio...")!;
+
+    // Start timing the core encoding pipeline loop
+    const start_time = time::now(time::clock::MONOTONIC);
 
     for (true) {
         // Explicitly slice the buffer based on the actual channel count
@@ -64,7 +69,6 @@ export fn main() void = {
 
         const block_size = (n / channels): u16;
         const bps = dec.meta.bit_depth: u8;
-
         // De-interleave: ensure we only iterate up to the samples actually read
         for (let i = 0z; i < block_size: size; i += 1) {
             left[i] = raw_samples[i * channels];
@@ -90,20 +94,22 @@ export fn main() void = {
             yield 0z;
         };
 
-        if (frame_count < 1) {
-            fmt::printfln("Encoding audio...")!;
-        };
-
         const frame_crc = flac::finalize_frame(&writer);
         flac::write_bits(&writer, frame_crc: u64, 16)!;
 
         frame_count += 1;
     };
 
-    fmt::printfln("Encoded {} frames to {}", frame_count, output_path)!;
+    // Calculate final processing duration metrics in seconds
+    const end_time = time::now(time::clock::MONOTONIC);
+    const total_sec = time::diff(start_time, end_time) / time::SECOND;
+
+    fmt::printfln("Encoded {} frames in {} s to {}", frame_count, total_sec, output_path)!;
 };
 
 fn encode_channel(w: *flac::bit_writer, samples: []i32, bps: u8) (size | io::error) = {
+    // Generate an LPC configuration to pass down.
+    // The subframe module will evaluate whether to use Fixed or LPC.
     const order = 8z;
     let windowed: [4096]f64 = [0.0f64...];
     let R: [9]f64 = [0.0f64...];
@@ -115,5 +121,5 @@ fn encode_channel(w: *flac::bit_writer, samples: []i32, bps: u8) (size | io::err
     lpc::levinson_durbin(R, lpc_f);
     const shift = lpc::quantize(lpc_f, q_lpc, 12);
 
-    return flac::write_subframe_lpc(w, samples, q_lpc, shift, bps)?;
+    return flac::write_subframe_lpc(w, samples, q_lpc, shift, bps);
 };
