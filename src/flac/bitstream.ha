@@ -21,6 +21,7 @@ export fn newwriter(h: io::handle) bit_writer = {
     };
 };
 
+// Writes up to 64 bits from a value.
 export fn write_bits(w: *bit_writer, value: u64, count: u8) (size | io::error) = {
     let total_written = 0z;
     for (let i = 0u8; i < count; i += 1) {
@@ -29,9 +30,7 @@ export fn write_bits(w: *bit_writer, value: u64, count: u8) (size | io::error) =
 
         w.buffer = (w.buffer << 1) | bit;
         w.bits_used += 1;
-
         if (w.bits_used == 8) {
-            // Update CRCs ONLY with completed bytes
             w.crc8 = crc8_update(w.crc8, w.buffer);
             w.crc16 = crc16_update(w.crc16, w.buffer);
 
@@ -44,9 +43,87 @@ export fn write_bits(w: *bit_writer, value: u64, count: u8) (size | io::error) =
     return total_written;
 };
 
-// A standard flush for subframes or entropy coding.
-// Aligns to the next byte boundary using MSB-padding.
-// Does NOT update CRCs (padding bits are excluded from FLAC CRCs).
+// Writes 'count' zero bits efficiently. Optimized for unary Rice coding.
+export fn write_zeros(w: *bit_writer, count: u32) (size | io::error) = {
+    if (count == 0) return 0z;
+    let total_written = 0z;
+    let remaining_bits = count;
+
+    // Phase 1: Clear out any unaligned pending bits in the buffer
+    if (w.bits_used > 0) {
+        const bits_to_fill = 8 - w.bits_used;
+        if (remaining_bits < bits_to_fill: u32) {
+            // Not enough zeros to finish the byte; just shift them in
+            w.buffer <<= remaining_bits: u8;
+            w.bits_used += remaining_bits: u8;
+            return 0z;
+        };
+
+        w.buffer <<= bits_to_fill;
+        w.crc8 = crc8_update(w.crc8, w.buffer);
+        w.crc16 = crc16_update(w.crc16, w.buffer);
+
+        const b: [1]u8 = [w.buffer];
+        total_written += io::write(w.handle, b)?;
+        w.buffer = 0;
+        w.bits_used = 0;
+        remaining_bits -= bits_to_fill: u32;
+    };
+
+    // Phase 2: Write bulk zero bytes directly to the handle
+    const zero_bytes = remaining_bits / 8;
+    if (zero_bytes > 0) {
+        let zeros_buf: [512]u8 = [0...];
+        let bytes_left = zero_bytes: size;
+
+        for (bytes_left > 0) {
+            const chunk = if (bytes_left < len(zeros_buf)) bytes_left else len(zeros_buf);
+
+            for (let i = 0z; i < chunk; i += 1) {
+                w.crc8 = crc8_update(w.crc8, 0);
+                w.crc16 = crc16_update(w.crc16, 0);
+            };
+
+            total_written += io::write(w.handle, zeros_buf[..chunk])?;
+            bytes_left -= chunk;
+        };
+        remaining_bits %= 8;
+    };
+
+    // Phase 3: Queue up any leftover bits (0 to 7)
+    if (remaining_bits > 0) {
+        w.buffer = 0;
+        w.bits_used = remaining_bits: u8;
+    };
+
+    return total_written;
+};
+
+// Writes raw byte blocks directly, automatically managing unaligned pending bits.
+export fn write_bytes(w: *bit_writer, bytes: []u8) (size | io::error) = {
+    if (len(bytes) == 0) return 0z;
+
+    // If there are unaligned bits in the buffer, they MUST be cleared first
+    // to maintain sequence integrity before writing raw blocks.
+    if (w.bits_used > 0) {
+        const final_byte = w.buffer << (8 - w.bits_used);
+        w.crc8 = crc8_update(w.crc8, final_byte);
+        w.crc16 = crc16_update(w.crc16, final_byte);
+        const b: [1]u8 = [final_byte];
+        io::write(w.handle, b)?;
+        w.buffer = 0;
+        w.bits_used = 0;
+    };
+
+    for (let i = 0z; i < len(bytes); i += 1) {
+        w.crc8 = crc8_update(w.crc8, bytes[i]);
+        w.crc16 = crc16_update(w.crc16, bytes[i]);
+    };
+
+    return io::write(w.handle, bytes);
+};
+
+// Aligns to the next byte boundary using MSB-padding. Excluded from FLAC CRCs.
 export fn flush(w: *bit_writer) (size | io::error) = {
     if (w.bits_used > 0) {
         const final_byte = w.buffer << (8 - w.bits_used);
@@ -59,16 +136,11 @@ export fn flush(w: *bit_writer) (size | io::error) = {
     return 0z;
 };
 
-// Specialized flush for the Frame Header.
-// FLAC requires the Frame Header CRC-8 to cover the ENTIRE header.
-// If the header ends on a partial byte, that byte MUST be in the CRC.
+// Specialized flush for the Frame Header. Final byte MUST be in CRC-8.
 export fn flush_header(w: *bit_writer) (size | io::error) = {
     if (w.bits_used > 0) {
         w.buffer <<= (8 - w.bits_used);
-
-        // FIX: The padded final byte of the header MUST be in CRC-8
         w.crc8 = crc8_update(w.crc8, w.buffer);
-
         const b: [1]u8 = [w.buffer];
         const n = io::write(w.handle, b)?;
         w.buffer = 0;
@@ -78,16 +150,12 @@ export fn flush_header(w: *bit_writer) (size | io::error) = {
     return 0z;
 };
 
-// Finalizes the entire frame.
-// Similar to flush_header, the final byte must be included in the CRC-16.
+// Finalizes the entire frame. Final byte MUST be included in CRC-16.
 export fn finalize_frame(w: *bit_writer) u16 = {
     const final_crc = w.crc16;
     if (w.bits_used > 0) {
         w.buffer <<= (8 - w.bits_used);
-
-        // FIX: The final byte of the frame MUST be included in CRC-16
         w.crc16 = crc16_update(w.crc16, w.buffer);
-
         const b: [1]u8 = [w.buffer];
         io::write(w.handle, b)!;
         w.buffer = 0;
@@ -100,6 +168,10 @@ export fn finalize_frame(w: *bit_writer) u16 = {
 export fn reset_crc8(w: *bit_writer) void = { w.crc8 = 0; };
 export fn reset_crc16(w: *bit_writer) void = { w.crc16 = 0; };
 
+export fn bits_pending(w: *bit_writer) u8 = {
+    return w.bits_used;
+};
+
 @test fn test_bit_writer() void = {
     let buf: [2]u8 = [0...];
     let mem = memio::fixed(buf);
@@ -109,8 +181,6 @@ export fn reset_crc16(w: *bit_writer) void = { w.crc16 = 0; };
     write_bits(&w, 0b0001, 4)!;
 
     write_bits(&w, 0b1, 1)!;
-
-    // FIX: Remove 'flac::' because we are already inside the flac package
     flush(&w)!;
 
     assert(buf[0] == 0xb1);

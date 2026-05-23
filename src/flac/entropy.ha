@@ -40,10 +40,17 @@ export fn write_rice(w: *bit_writer, val: i32, s: u8) (size | io::error) = {
     assert(q <= 30, "Rice quotient overflow — caller must use higher rice_k or verbatim");
 
     let bits = 0z;
-    for (let i = 0u32; i < q; i += 1) {
-        bits += write_bits(w, 0, 1)?;
+
+    // Write unary code (q zeros + terminator 1) as a single bit pattern.
+    // The unary code is q zeros followed by a 1, which in MSB-first order
+    // is exactly the bit pattern of value 1 in (q+1) bits.
+    // This replaces q separate write_bits calls with a single call.
+    if (q > 0) {
+        bits += write_bits(w, 1u64, (q + 1): u8)?;
+    } else {
+        bits += write_bits(w, 1, 1)?;
     };
-    bits += write_bits(w, 1, 1)?;
+
     if (s > 0) {
         bits += write_bits(w, r: u64, s)?;
     };
