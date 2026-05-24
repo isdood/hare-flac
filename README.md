@@ -63,3 +63,7 @@ The codec follows the standard FLAC analysis flow:
 3. **Recursion**: Solving Yule-Walker equations via Levinson-Durbin.
 4. **Quantization**: Converting optimal coefficients to 12-15 bit integers.
 5. **Residual Calculation**: Generating the difference signal via integer-domain prediction.
+
+## Notes
+
+- This project is entirely a lesson for myself, learning about audio encoding, decoding, the FLAC specification as a whole & the Hare language. It should be treated as no more than a learning repo at this point.
