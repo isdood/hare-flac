@@ -8,7 +8,7 @@ HARECFLAGS =
 all: flac-enc
 
 flac-enc:
-	$(HARE) build $(HARECFLAGS) -o flac-enc cmd/flac-enc/
+	$(HARE) build $(HARECFLAGS) -R -o flac-enc cmd/flac-enc/
 
 test:
 	$(HARE) test vendor/wav/
