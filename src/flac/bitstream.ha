@@ -52,41 +52,40 @@ fn emit_byte(w: *bit_writer, b: u8) (void | io::error) = {
     };
 };
 
-// Writes up to 64 bits from a value, MSB first.
-//
-// Strategy: rather than looping bit-by-bit, use a 16-bit staging word.
-// The existing partial byte sits in the high bits of `word`, and the new
-// `count` bits are shifted in below it. Then, drain complete bytes from
-// the top of `word` one at a time, leaving any partial remainder for the
-// next call.
 export fn write_bits(w: *bit_writer, value: u64, count: u8) (size | io::error) = {
     if (count == 0) return 0z;
 
-    // Build a 16-bit staging word:
-    //   [ existing bits_used partial bits | incoming count bits | padding ]
-    // Shift `value` up so the new bits are MSB-aligned within the
-    // remaining space, then merge with the partial byte already in `buffer`.
-    let total_bits = w.bits_used + count;
-
-    // Pack everything into a u64 working register.
-    // Place `buffer` at the top, then the new bits immediately below.
-    let word: u64 = (w.buffer: u64 << (count: u64))
-                  | (value & ((1u64 << count) - 1));
-
-    // `total_bits` is the number of valid bits in `word` starting from bit
-    // (total_bits - 1) down to bit 0. Drain complete bytes from the MSB end.
     let bytes_written = 0z;
-    for (total_bits >= 8) {
-        total_bits -= 8;
-        const byte = ((word >> total_bits) & 0xFF): u8;
-        emit_byte(w, byte)?;
-        bytes_written += 1;
-    };
+    let remaining_count = count;
 
-    // Store any remaining partial bits back into buffer.
-    // `total_bits` is now 0..7.
-    w.bits_used = total_bits;
-    w.buffer = if (total_bits > 0) (word & ((1u64 << total_bits) - 1)): u8 else 0u8;
+    // Mask the incoming value to ensure no dirty upper bits exist
+    let clean_value = if (count == 64) value else value & ((1u64 << count) - 1);
+
+    // If the incoming count is large, or pooling it with bits_used exceeds
+    // the safe capacity of a u64 register staging window, we process it
+    // in digestible chunks.
+    for (remaining_count > 0) {
+        const space_in_buffer = 8 - w.bits_used;
+
+        if (remaining_count >= space_in_buffer) {
+            // We have enough bits coming in to completely fill the current partial byte
+            const shift = remaining_count - space_in_buffer;
+            const bits_to_take = ((clean_value >> shift) & ((1u64 << space_in_buffer) - 1)): u8;
+
+            w.buffer = (w.buffer << space_in_buffer) | bits_to_take;
+            emit_byte(w, w.buffer)?;
+            bytes_written += 1;
+
+            remaining_count -= space_in_buffer;
+            w.bits_used = 0;
+            w.buffer = 0;
+        } else {
+            // The remaining bits don't even fill up the current partial byte
+            w.buffer = (w.buffer << remaining_count) | (clean_value: u8 & ((1u8 << remaining_count) - 1));
+            w.bits_used += remaining_count;
+            remaining_count = 0;
+        };
+    };
 
     return bytes_written;
 };
@@ -97,7 +96,7 @@ export fn write_zeros(w: *bit_writer, count: u32) (size | io::error) = {
     let total_written = 0z;
     let remaining_bits = count;
 
-    // Phase 1: Fill out the partial byte if one is in progress.
+    // Fill out the partial byte if one is in progress.
     if (w.bits_used > 0) {
         const bits_to_fill = (8 - w.bits_used): u32;
         if (remaining_bits < bits_to_fill) {
@@ -113,7 +112,7 @@ export fn write_zeros(w: *bit_writer, count: u32) (size | io::error) = {
         remaining_bits -= bits_to_fill;
     };
 
-    // Phase 2: Emit whole zero bytes directly.
+    // Emit whole zero bytes directly.
     const zero_bytes = remaining_bits / 8;
     if (zero_bytes > 0) {
         for (let i = 0u32; i < zero_bytes; i += 1) {
@@ -123,7 +122,7 @@ export fn write_zeros(w: *bit_writer, count: u32) (size | io::error) = {
         remaining_bits %= 8;
     };
 
-    // Phase 3: Queue any leftover bits (0–7) into the partial buffer.
+    // Queue any leftover bits (0–7) into the partial buffer.
     if (remaining_bits > 0) {
         w.buffer = 0;
         w.bits_used = remaining_bits: u8;

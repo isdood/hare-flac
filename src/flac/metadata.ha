@@ -34,7 +34,6 @@ export fn write_stream_header(w: *bit_writer, dec: *wav::decoder) (size | io::er
     total_bits += write_bits(w, (dec.meta.bit_depth - 1): u64, 5)?;
 
     // 4. Total samples (36 bits)
-    // FIX: Calculate total samples from WAV data size to prevent DTS mismatch warnings.
     const bytes_per_sample = (dec.meta.bit_depth / 8): u32;
     const total_samples = dec.data_size / (dec.meta.channels: u32 * bytes_per_sample);
     total_bits += write_bits(w, total_samples: u64, 36)?;

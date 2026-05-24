@@ -11,7 +11,8 @@ flac-enc:
 	$(HARE) build $(HARECFLAGS) -o flac-enc cmd/flac-enc/
 
 test:
-	$(HARE) test src/wav/
+	$(HARE) test vendor/wav/
+	$(HARE) test vendor/lpc/
 
 clean:
 	rm -f flac-enc
