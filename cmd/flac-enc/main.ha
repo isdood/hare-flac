@@ -7,7 +7,6 @@ use lpc;
 use flac;
 use time;
 
-// Use def for compile-time constants to satisfy array dimension requirements
 def MAX_BLOCK: size = 4096;
 
 export fn main() void = {
@@ -44,32 +43,27 @@ export fn main() void = {
     flac::write_stream_header(&writer, &dec)!;
 
     const channels = dec.meta.channels: size;
-    // Use the def-based constant for fixed-size array allocation
     let raw_samples: [MAX_BLOCK * 2]i32 = [0...];
     let left: [MAX_BLOCK]i32 = [0...];
     let right: [MAX_BLOCK]i32 = [0...];
     let frame_count = 0u32;
 
     fmt::printfln("Encoding audio...")!;
-
-    // Start timing the core encoding pipeline loop
     const start_time = time::now(time::clock::MONOTONIC);
 
     for (true) {
-        // Explicitly slice the buffer based on the actual channel count
-        // to prevent reading into unallocated space or causing alignment shifts
         const buffer_slice = raw_samples[..MAX_BLOCK * channels];
         const n = match (wav::read_samples(&stream, buffer_slice)) {
-        case let s: size =>
-            if (s == 0) break else yield s;
-        case let e: wav::error => break;
+            case let s: size =>
+                if (s == 0) break else yield s;
+            case let e: wav::error => break;
         };
 
         flac::reset_crc16(&writer);
 
         const block_size = (n / channels): u16;
         const bps = dec.meta.bit_depth: u8;
-        // De-interleave: ensure we only iterate up to the samples actually read
+
         for (let i = 0z; i < block_size: size; i += 1) {
             left[i] = raw_samples[i * channels];
             if (channels > 1) {
@@ -86,7 +80,6 @@ export fn main() void = {
             frame_count
         )!;
 
-        // Encode each channel. If mono, only the left subframe is written.
         const left_bits = encode_channel(&writer, left[..block_size], bps)!;
         const right_bits = if (channels > 1) {
             yield encode_channel(&writer, right[..block_size], bps)!;
@@ -100,7 +93,10 @@ export fn main() void = {
         frame_count += 1;
     };
 
-    // Calculate final processing duration metrics in seconds
+    // CRITICAL: Flush the remaining bits of the last frame out to disk!
+    // Without this, the bit writer's buffer holds back the final bytes of the file.
+    flac::finalize_frame(&writer);
+
     const end_time = time::now(time::clock::MONOTONIC);
     const total_sec = time::diff(start_time, end_time) / time::SECOND;
 
@@ -108,14 +104,11 @@ export fn main() void = {
 };
 
 fn encode_channel(w: *flac::bit_writer, samples: []i32, bps: u8) (size | io::error) = {
-    // Generate an LPC configuration to pass down.
-    // The subframe module will evaluate whether to use Fixed or LPC.
     const order = 8z;
     let windowed: [4096]f64 = [0.0f64...];
     let R: [9]f64 = [0.0f64...];
     let lpc_f: [8]f64 = [0.0f64...];
     let q_lpc: [8]i32 = [0...];
-
     lpc::window_hann(samples, windowed[..len(samples)]);
     lpc::autocorrelation(windowed[..len(samples)], R);
     lpc::levinson_durbin(R, lpc_f);

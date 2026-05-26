@@ -77,13 +77,20 @@ export fn write_frame_header(
         total_bits += write_bits(w, (block_size - 1): u64, 16)?;
     };
 
+    // If the sample rate code requires an explicit literal suffix, it would go here.
+
     // 7. CRC-8 Calculation
-    // Safety: Flush the header to ensure the final bits are in the CRC
-    flush_header(w)?;
+    // The CRC-8 covers the entire frame header up to this point.
+    // We must pad the end of the header to a byte boundary so that the CRC-8
+    // field itself alignment-starts cleanly on a byte boundary.
+    if (w.bits_used > 0) {
+        const padding_bits = 8 - w.bits_used;
+        total_bits += write_bits(w, 0, padding_bits)?;
+    };
+
     const header_crc = w.crc8;
 
     // 8. Write the 8-bit CRC-8
     total_bits += write_bits(w, header_crc: u64, 8)?;
-
     return total_bits;
 };
