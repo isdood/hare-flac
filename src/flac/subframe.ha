@@ -33,7 +33,6 @@ export fn write_subframe_lpc(
 			const v = fixed_res_buf[i];
 			current_fixed_sum += if (v >= 0) v: u64 else (-(v: i64)): u64;
 		};
-
 		if (current_fixed_sum: f64 < min_fixed_sum) {
 			min_fixed_sum = current_fixed_sum: f64;
 			best_fixed_order = order;
@@ -50,12 +49,15 @@ export fn write_subframe_lpc(
 
 	let lpc_exploded = false;
 	let lpc_sum = 0u64;
+
+	// Threshold scaled appropriately for 24-bit audio headroom
+	const explosion_threshold: u64 = if (bps > 16) 2097152u64 else 8192u64;
+
 	for (let i = p; i < n; i += 1) {
 		const v = lpc_res[i];
 		const abs_v = if (v >= 0) v: u64 else (-(v: i64)): u64;
 		lpc_sum += abs_v;
-
-		if (abs_v > 8192) {
+		if (abs_v > explosion_threshold) {
 			lpc_exploded = true;
 		};
 	};
@@ -68,12 +70,13 @@ export fn write_subframe_lpc(
 	// Otherwise proceed with standard LPC safely
 	let total_bits = 0z;
 	const order = p: u8;
-
 	const subframe_type = 0b00100000u64 | (order - 1): u64;
 	total_bits += write_bits(w, subframe_type << 1, 8)?;
 
 	for (let i = 0z; i < p; i += 1) {
-		total_bits += write_bits(w, (samples[i]: u64) & ((1u64 << bps) - 1), bps)?;
+		// Convert signed i32 directly to its equivalent two's complement u64 representation
+		const val_u64 = samples[i]: i64: u64;
+		total_bits += write_bits(w, val_u64, bps)?;
 	};
 
 	const coeff_precision: u8 = 15;
@@ -87,7 +90,6 @@ export fn write_subframe_lpc(
 	return total_bits;
 };
 
-// Writes a FLAC fixed-predictor subframe (Orders 0 - 4)
 fn write_subframe_fixed(
 	w: *bit_writer,
 	samples: []i32,
@@ -98,16 +100,15 @@ fn write_subframe_fixed(
 	let total_bits = 0z;
 	const n = len(samples);
 
-	// FLAC Fixed Subframe encoding type bits prefix format: 001000 + order
 	const subframe_type = 0b001000u64 | order: u64;
 	total_bits += write_bits(w, subframe_type << 1, 8)?;
 
-	// Write unencoded "warm-up" samples (matching predictor order length)
+	// Write unencoded "warm-up" samples
 	for (let i = 0z; i < order: size; i += 1) {
-		total_bits += write_bits(w, (samples[i]: u64) & ((1u64 << bps) - 1), bps)?;
+		const val_u64 = samples[i]: i64: u64;
+		total_bits += write_bits(w, val_u64, bps)?;
 	};
 
-	// Write the residual sequence following the warmup phase
 	total_bits += write_residuals(w, residuals[order..n], order)?;
 	return total_bits;
 };
@@ -120,7 +121,8 @@ fn write_subframe_verbatim(
 	let total_bits = 0z;
 	total_bits += write_bits(w, 0x04, 8)?;
 	for (let i = 0z; i < len(samples); i += 1) {
-		total_bits += write_bits(w, (samples[i]: u64) & ((1u64 << bps) - 1), bps)?;
+		const val_u64 = samples[i]: i64: u64;
+		total_bits += write_bits(w, val_u64, bps)?;
 	};
 	return total_bits;
 };
@@ -130,15 +132,13 @@ fn best_partition_order(residuals: []i32, predictor_order: u8) u8 = {
     const block_size = n + predictor_order: size;
     let best_order: u8 = 0;
     let best_bits: u64 = ~0u64;
-
     for (let order = 0u8; order <= 4u8; order += 1) {
         const num_partitions = 1u32 << order: u32;
-        // Block size must divide evenly into partitions
         if (block_size: u32 % num_partitions != 0) continue;
         const part_size = block_size: u32 / num_partitions;
         if (part_size <= predictor_order: u32) continue;
 
-        let estimated_bits: u64 = 0;
+        let use_rice2 = false;
         let pos = 0z;
         for (let p = 0u32; p < num_partitions; p += 1) {
             const count: size = if (p == 0)
@@ -153,11 +153,36 @@ fn best_partition_order(residuals: []i32, predictor_order: u8) u8 = {
                 const zz = zig_zag(partition[i]);
                 if (zz > max_zz) max_zz = zz;
             };
-            for (max_zz >> rice_k: u32 > 30 && rice_k < 14) {
+            for (max_zz >> rice_k: u32 > 30 && rice_k < 30) {
+                rice_k += 1;
+            };
+            if (rice_k > 14) {
+                use_rice2 = true;
+            };
+            pos += count;
+        };
+
+        let estimated_bits: u64 = 0;
+        const k_bits: u64 = if (use_rice2) 5 else 4;
+        pos = 0z;
+        for (let p = 0u32; p < num_partitions; p += 1) {
+            const count: size = if (p == 0)
+                (part_size - predictor_order: u32): size
+            else
+                part_size: size;
+            const partition = residuals[pos..pos + count];
+
+            let rice_k = optimize_rice(partition);
+            let max_zz = 0u32;
+            for (let i = 0z; i < len(partition); i += 1) {
+                const zz = zig_zag(partition[i]);
+                if (zz > max_zz) max_zz = zz;
+            };
+            for (max_zz >> rice_k: u32 > 30 && rice_k < 30) {
                 rice_k += 1;
             };
 
-            estimated_bits += 4;
+            estimated_bits += k_bits;
             for (let i = 0z; i < len(partition); i += 1) {
                 const zz = zig_zag(partition[i]);
                 estimated_bits += (zz >> rice_k: u32): u64 + 1 + rice_k: u64;
@@ -180,15 +205,13 @@ fn write_residuals(
     predictor_order: u8,
 ) (size | io::error) = {
     let total_bits = 0z;
-    total_bits += write_bits(w, 0, 2)?;
 
     const partition_order: u8 = best_partition_order(residuals, predictor_order);
-    total_bits += write_bits(w, partition_order: u64, 4)?;
-
     const block_size = len(residuals) + predictor_order: size;
     const num_partitions = 1u32 << partition_order: u32;
     const part_size = block_size: u32 / num_partitions;
 
+    let use_rice2 = false;
     let pos = 0z;
     for (let p = 0u32; p < num_partitions; p += 1) {
         const count: size = if (p == 0)
@@ -203,10 +226,47 @@ fn write_residuals(
             const zz = zig_zag(residuals[i]);
             if (zz > max_zz) max_zz = zz;
         };
-        for (max_zz >> rice_k: u32 > 30 && rice_k < 14) {
+        for (max_zz >> rice_k: u32 > 30 && rice_k < 30) {
             rice_k += 1;
         };
-        total_bits += write_bits(w, rice_k: u64, 4)?;
+        if (rice_k > 14) {
+            use_rice2 = true;
+        };
+        pos += count;
+    };
+
+    if (use_rice2) {
+        total_bits += write_bits(w, 1, 2)?;
+    } else {
+        total_bits += write_bits(w, 0, 2)?;
+    };
+
+    total_bits += write_bits(w, partition_order: u64, 4)?;
+
+    pos = 0z;
+    for (let p = 0u32; p < num_partitions; p += 1) {
+        const count: size = if (p == 0)
+            (part_size - predictor_order: u32): size
+        else
+            part_size: size;
+        const end = pos + count;
+
+        let rice_k = optimize_rice(residuals[pos..end]);
+        let max_zz = 0u32;
+        for (let i = pos; i < end; i += 1) {
+            const zz = zig_zag(residuals[i]);
+            if (zz > max_zz) max_zz = zz;
+        };
+        for (max_zz >> rice_k: u32 > 30 && rice_k < 30) {
+            rice_k += 1;
+        };
+
+        if (use_rice2) {
+            total_bits += write_bits(w, rice_k: u64, 5)?;
+        } else {
+            total_bits += write_bits(w, rice_k: u64, 4)?;
+        };
+
         for (let i = pos; i < end; i += 1) {
             total_bits += write_rice(w, residuals[i], rice_k)?;
         };

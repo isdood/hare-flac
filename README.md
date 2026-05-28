@@ -1,7 +1,7 @@
 # hare-flac
 
 - A native Hare implementation of the FLAC (Free Lossless Audio Codec) specification. This project focuses on reconstruction using Linear Predictive Coding (LPC).
-- The project is currently in a useable state for 16bit .wav to .flac conversions - I haven't tested 24bit. Supports various sample rates.
+- Works with 16bit & 24bit audio. Supports various sample rates.
 - Verified lossless audio compression via an MD5 check. 
 
 ## Features
