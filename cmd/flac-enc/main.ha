@@ -111,7 +111,7 @@ fn encode_channel(w: *flac::bit_writer, samples: []i32, bps: u8) (size | io::err
     lpc::window_hann(samples, windowed[..len(samples)]);
     lpc::autocorrelation(windowed[..len(samples)], R);
     lpc::levinson_durbin(R, lpc_f);
-    const shift = lpc::quantize(lpc_f, q_lpc, 12);
+    const shift = lpc::quantize(lpc_f, q_lpc, 15);
 
     return flac::write_subframe_lpc(w, samples, q_lpc, shift, bps);
 };
