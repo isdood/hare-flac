@@ -6,6 +6,7 @@ use wav;
 use lpc;
 use flac;
 use time;
+use math;
 
 def MAX_BLOCK: size = 4096;
 
@@ -93,8 +94,7 @@ export fn main() void = {
         frame_count += 1;
     };
 
-    // CRITICAL: Flush the remaining bits of the last frame out to disk!
-    // Without this, the bit writer's buffer holds back the final bytes of the file.
+    // Flush the remaining bits of the last frame out to disk
     flac::finalize_frame(&writer);
 
     const end_time = time::now(time::clock::MONOTONIC);
@@ -104,15 +104,25 @@ export fn main() void = {
 };
 
 fn encode_channel(w: *flac::bit_writer, samples: []i32, bps: u8) (size | io::error) = {
-    const order = 8z;
-    let windowed: [4096]f64 = [0.0f64...];
-    let R: [9]f64 = [0.0f64...];
-    let lpc_f: [8]f64 = [0.0f64...];
-    let q_lpc: [8]i32 = [0...];
-    lpc::window_hann(samples, windowed[..len(samples)]);
-    lpc::autocorrelation(windowed[..len(samples)], R);
-    lpc::levinson_durbin(R, lpc_f);
-    const shift = lpc::quantize(lpc_f, q_lpc, 12);
+	const max_order = 8z;
+	let windowed: [4096]f64 = [0.0f64...];
+	let R: [9]f64 = [0.0f64...];
+	let lpc_f: [8]f64 = [0.0f64...];
+	let q_lpc: [8]i32 = [0...];
 
-    return flac::write_subframe_lpc(w, samples, q_lpc, shift, bps);
+	lpc::window_hann(samples, windowed[..len(samples)]);
+	lpc::autocorrelation(windowed[..len(samples)], R);
+	if (R[0] < 1e-9) {
+		return flac::write_subframe_lpc(w, samples, [], 0, bps);
+	};
+
+	lpc::levinson_durbin(R, lpc_f);
+
+	let actual_order = max_order;
+	for (actual_order > 1 && math::absf64(lpc_f[actual_order - 1]) < 0.01) {
+		actual_order -= 1;
+	};
+
+	const shift = lpc::quantize(lpc_f[..actual_order], q_lpc[..actual_order], 12);
+	return flac::write_subframe_lpc(w, samples, q_lpc[..actual_order], shift, bps);
 };

@@ -17,13 +17,11 @@ export fn write_subframe_lpc(
 		return write_subframe_verbatim(w, samples, bps);
 	};
 
-	// --- 1. Evaluate Fixed Predictors (Orders 0 to 4) ---
+	// Evaluate Fixed Predictors (Orders 0 to 4)
 	let best_fixed_order = 0u8;
-	let min_fixed_sum = math::INF;
+	let min_fixed_variance = math::INF;
 	let fixed_res_buf: [4096]i32 = [0...];
 	let best_fixed_res: [4096]i32 = [0...];
-
-	// Safety check: Never evaluate a fixed order higher than the total number of samples.
 	const max_possible_order = if (n < 4) n: u8 else 4u8;
 
 	for (let order = 0u8; order <= max_possible_order; order += 1) {
@@ -35,8 +33,16 @@ export fn write_subframe_lpc(
 			current_fixed_sum += if (v >= 0) v: u64 else (-(v: i64)): u64;
 		};
 
-		if (current_fixed_sum: f64 < min_fixed_sum) {
-			min_fixed_sum = current_fixed_sum: f64;
+		// Normalize by actual counted elements to make evaluation fair
+		const counted_elements = (n - order: size): f64;
+		const current_fixed_variance = if (counted_elements > 0.0) {
+			yield (current_fixed_sum: f64) / counted_elements;
+		} else {
+			yield math::INF;
+		};
+
+		if (current_fixed_variance < min_fixed_variance) {
+			min_fixed_variance = current_fixed_variance;
 			best_fixed_order = order;
 			for (let i = 0z; i < n; i += 1) {
 				best_fixed_res[i] = fixed_res_buf[i];
@@ -44,7 +50,7 @@ export fn write_subframe_lpc(
 		};
 	};
 
-	// --- 2. Compute LPC residuals ---
+	// Compute LPC residuals
 	let lpc_res_buf: [4096]i32 = [0...];
 	let lpc_res = lpc_res_buf[..n];
 	lpc::predict_lpc(samples, q_lpc, shift, lpc_res);
@@ -55,18 +61,24 @@ export fn write_subframe_lpc(
 		const v = lpc_res[i];
 		const abs_v = if (v >= 0) v: u64 else (-(v: i64)): u64;
 		lpc_sum += abs_v;
-
 		if (abs_v > 8192) {
 			lpc_exploded = true;
 		};
 	};
 
-	// --- 3. Optimization Selection Barrier ---
-	if (lpc_exploded || min_fixed_sum < lpc_sum: f64) {
+	// Normalize LPC sum to compare fairly against fixed predictor variance
+	const lpc_counted_elements = (n - p): f64;
+	const lpc_variance = if (lpc_counted_elements > 0.0) {
+		yield (lpc_sum: f64) / lpc_counted_elements;
+	} else {
+		yield math::INF;
+	};
+
+	// Optimization Selection Barrier (comparing normalized variance)
+	if (lpc_exploded || min_fixed_variance < lpc_variance) {
 		return write_subframe_fixed(w, samples, best_fixed_res[..n], best_fixed_order, bps);
 	};
 
-	// Otherwise proceed with standard LPC safely
 	let total_bits = 0z;
 	const order = p: u8;
 
@@ -132,27 +144,48 @@ fn write_residuals(
 	predictor_order: u8,
 ) (size | io::error) = {
 	let total_bits = 0z;
+
 	total_bits += write_bits(w, 0, 2)?;
 
-	const partition_order: u8 = 0;
+	const partition_order: u8 = 4;
 	total_bits += write_bits(w, partition_order: u64, 4)?;
 
-	let max_zz = 0u32;
-	for (let i = 0z; i < len(residuals); i += 1) {
-		const zz = zig_zag(residuals[i]);
-		if (zz > max_zz) max_zz = zz;
-	};
+	const num_partitions = (1z << partition_order);
 
-	let rice_k = optimize_rice(residuals);
-	// Ensure max quotient stays within FLAC's hard limit of 30
-	for (max_zz >> rice_k: u32 > 30 && rice_k < 14) {
-		rice_k += 1;
-	};
+	const total_samples_including_warmup = len(residuals) + predictor_order: size;
+	const partition_samples = total_samples_including_warmup / num_partitions;
 
-	total_bits += write_bits(w, rice_k: u64, 4)?;
+	for (let p = 0z; p < num_partitions; p += 1) {
+		const start_full = p * partition_samples;
+		const end_full = if (p == num_partitions - 1) total_samples_including_warmup else (p + 1) * partition_samples;
 
-	for (let i = 0z; i < len(residuals); i += 1) {
-		total_bits += write_rice(w, residuals[i], rice_k)?;
+		let start_idx = if (start_full < predictor_order: size) 0z else start_full - predictor_order: size;
+		let end_idx = if (end_full < predictor_order: size) 0z else end_full - predictor_order: size;
+
+		if (start_idx == end_idx) {
+			total_bits += write_bits(w, 0, 4)?;
+			continue;
+		};
+
+		const part_res = residuals[start_idx..end_idx];
+
+		let max_zz = 0u32;
+		for (let i = 0z; i < len(part_res); i += 1) {
+			const zz = zig_zag(part_res[i]);
+			if (zz > max_zz) max_zz = zz;
+		};
+
+		let rice_k = optimize_rice(part_res);
+
+		for (max_zz >> rice_k: u32 > 30 && rice_k < 14) {
+			rice_k += 1;
+		};
+
+		total_bits += write_bits(w, rice_k: u64, 4)?;
+
+		for (let i = 0z; i < len(part_res); i += 1) {
+			total_bits += write_rice(w, part_res[i], rice_k)?;
+		};
 	};
 
 	return total_bits;

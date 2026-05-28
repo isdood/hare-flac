@@ -57,7 +57,7 @@ export fn write_frame_header(
         case 88200 => yield 0b0001;
         case 176400 => yield 0b0010;
         case 192000 => yield 0b0011;
-        case       => yield 0b1100; // get 8-bit kHz literal
+        case       => yield 0b1100;
     };
     total_bits += write_bits(w, sr_code, 4)?;
 
@@ -77,12 +77,7 @@ export fn write_frame_header(
         total_bits += write_bits(w, (block_size - 1): u64, 16)?;
     };
 
-    // If the sample rate code requires an explicit literal suffix, it would go here.
-
-    // 7. CRC-8 Calculation
-    // The CRC-8 covers the entire frame header up to this point.
-    // We must pad the end of the header to a byte boundary so that the CRC-8
-    // field itself alignment-starts cleanly on a byte boundary.
+    // CRC-8 Calculation
     if (w.bits_used > 0) {
         const padding_bits = 8 - w.bits_used;
         total_bits += write_bits(w, 0, padding_bits)?;
@@ -90,7 +85,6 @@ export fn write_frame_header(
 
     const header_crc = w.crc8;
 
-    // 8. Write the 8-bit CRC-8
     total_bits += write_bits(w, header_crc: u64, 8)?;
     return total_bits;
 };
