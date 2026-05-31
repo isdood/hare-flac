@@ -1,2 +1,0 @@
-A reminder - ~1 out've 50 songs I'm getting a single frame skip throughout an entire track. Unsure the cause yet, though I'd suspect LPC prediction errors, as the framing all seems correct.
-The only track I've come across with this issue is "Titanic" by Juice WRLD - 16bit 44100 Hz. Will need to look into this.
