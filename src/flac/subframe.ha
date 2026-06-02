@@ -13,68 +13,44 @@ export fn write_subframe_lpc(
 ) (size | io::error) = {
 	const n = len(samples);
 	const p = len(q_lpc);
+
+	// Empty coefficient map signals explicit routing to Fixed Predictors
 	if (p == 0) {
-		return write_subframe_verbatim(w, samples, bps);
-	};
+		let best_fixed_order = 0u8;
+		let min_fixed_sum = math::INF;
+		let fixed_res_buf: [4096]i32 = [0...];
+		let best_fixed_res: [4096]i32 = [0...];
+		const max_possible_order = if (n < 4) n: u8 else 4u8;
 
-	// Evaluate Fixed Predictors (Orders 0 to 4)
-	let best_fixed_order = 0u8;
-	let min_fixed_sum = math::INF;
-	let fixed_res_buf: [4096]i32 = [0...];
-	let best_fixed_res: [4096]i32 = [0...];
-
-	const max_possible_order = if (n < 4) n: u8 else 4u8;
-
-	for (let order = 0u8; order <= max_possible_order; order += 1) {
-		lpc::predict_fixed(samples, order, fixed_res_buf[..n]);
-
-		let current_fixed_sum = 0u64;
-		for (let i = order: size; i < n; i += 1) {
-			const v = fixed_res_buf[i];
-			current_fixed_sum += if (v >= 0) v: u64 else (-(v: i64)): u64;
-		};
-		if (current_fixed_sum: f64 < min_fixed_sum) {
-			min_fixed_sum = current_fixed_sum: f64;
-			best_fixed_order = order;
-			for (let i = 0z; i < n; i += 1) {
-				best_fixed_res[i] = fixed_res_buf[i];
+		for (let order = 0u8; order <= max_possible_order; order += 1) {
+			lpc::predict_fixed(samples, order, fixed_res_buf[..n]);
+			let current_fixed_sum = 0u64;
+			for (let i = order: size; i < n; i += 1) {
+				const v = fixed_res_buf[i];
+				current_fixed_sum += if (v >= 0) v: u64 else (-(v: i64)): u64;
+			};
+			if (current_fixed_sum: f64 < min_fixed_sum) {
+				min_fixed_sum = current_fixed_sum: f64;
+				best_fixed_order = order;
+				for (let i = 0z; i < n; i += 1) {
+					best_fixed_res[i] = fixed_res_buf[i];
+				};
 			};
 		};
+		return write_subframe_fixed(w, samples, best_fixed_res[..n], best_fixed_order, bps);
 	};
 
-	// Compute LPC residuals
+	// Compute LPC residuals using the explicitly chosen parameters
 	let lpc_res_buf: [4096]i32 = [0...];
 	let lpc_res = lpc_res_buf[..n];
 	lpc::predict_lpc(samples, q_lpc, shift, lpc_res);
 
-	let lpc_exploded = false;
-	let lpc_sum = 0u64;
-
-	// Threshold scaled appropriately for 24-bit audio headroom
-	const explosion_threshold: u64 = if (bps > 16) 2097152u64 else 8192u64;
-
-	for (let i = p; i < n; i += 1) {
-		const v = lpc_res[i];
-		const abs_v = if (v >= 0) v: u64 else (-(v: i64)): u64;
-		lpc_sum += abs_v;
-		if (abs_v > explosion_threshold) {
-			lpc_exploded = true;
-		};
-	};
-
-	// Optimization Selection Barrier
-	if (lpc_exploded || min_fixed_sum < lpc_sum: f64) {
-		return write_subframe_fixed(w, samples, best_fixed_res[..n], best_fixed_order, bps);
-	};
-
-	// Otherwise proceed with standard LPC safely
 	let total_bits = 0z;
 	const order = p: u8;
 	const subframe_type = 0b00100000u64 | (order - 1): u64;
 	total_bits += write_bits(w, subframe_type << 1, 8)?;
 
 	for (let i = 0z; i < p; i += 1) {
-		// Convert signed i32 directly to its equivalent two's complement u64 representation
 		const val_u64 = samples[i]: i64: u64;
 		total_bits += write_bits(w, val_u64, bps)?;
 	};
@@ -103,7 +79,6 @@ fn write_subframe_fixed(
 	const subframe_type = 0b001000u64 | order: u64;
 	total_bits += write_bits(w, subframe_type << 1, 8)?;
 
-	// Write unencoded "warm-up" samples
 	for (let i = 0z; i < order: size; i += 1) {
 		const val_u64 = samples[i]: i64: u64;
 		total_bits += write_bits(w, val_u64, bps)?;
@@ -132,6 +107,7 @@ fn best_partition_order(residuals: []i32, predictor_order: u8) u8 = {
     const block_size = n + predictor_order: size;
     let best_order: u8 = 0;
     let best_bits: u64 = ~0u64;
+
     for (let order = 0u8; order <= 4u8; order += 1) {
         const num_partitions = 1u32 << order: u32;
         if (block_size: u32 % num_partitions != 0) continue;
@@ -189,7 +165,6 @@ fn best_partition_order(residuals: []i32, predictor_order: u8) u8 = {
             };
             pos += count;
         };
-
         if (estimated_bits < best_bits) {
             best_bits = estimated_bits;
             best_order = order;
@@ -205,7 +180,6 @@ fn write_residuals(
     predictor_order: u8,
 ) (size | io::error) = {
     let total_bits = 0z;
-
     const partition_order: u8 = best_partition_order(residuals, predictor_order);
     const block_size = len(residuals) + predictor_order: size;
     const num_partitions = 1u32 << partition_order: u32;
@@ -240,7 +214,6 @@ fn write_residuals(
     } else {
         total_bits += write_bits(w, 0, 2)?;
     };
-
     total_bits += write_bits(w, partition_order: u64, 4)?;
 
     pos = 0z;

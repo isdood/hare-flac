@@ -6,6 +6,7 @@ use wav;
 use lpc;
 use flac;
 use time;
+use math;
 
 def MAX_BLOCK: size = 4096;
 
@@ -151,8 +152,7 @@ export fn main() void = {
 fn encode_channel(w: *flac::bit_writer, samples: []i32, bps: u8) (size | io::error) = {
     let windowed: [4096]f64 = [0.0f64...];
     let R: [13]f64 = [0.0...];
-    let lpc_coefs: [12]f64 = [0.0...];
-    let q_lpc: [12]i32 = [0...];
+    let full_lpc_coefs: [12]f64 = [0.0...];
     let residual: [4096]i32 = [0...];
 
     let clean_samples: [4096]i32 = [0...];
@@ -161,20 +161,88 @@ fn encode_channel(w: *flac::bit_writer, samples: []i32, bps: u8) (size | io::err
         clean_samples[i] = (samples[i] << shift_bits) >> shift_bits;
     };
 
+    let best_score = math::INF;
+    let best_shift = 0u8;
+    let best_q_lpc: [12]i32 = [0...];
+    let is_fixed = true;
+    let selected_method_order: size = 0z;
+
+    const total_samples = len(samples): f64;
+
+    // Evaluate Fixed Predictors (Orders 0 to 4)
+    const max_fixed = if (len(samples) < 4) len(samples) else 4z;
+    for (let order = 0z; order <= max_fixed; order += 1) {
+        lpc::predict_fixed(clean_samples[..len(samples)], order: u8, residual[..len(samples)]);
+
+        let abs_sum = 0.0f64;
+        for (let i = order; i < len(samples); i += 1) {
+            abs_sum += math::absf64(residual[i]: f64);
+        };
+        if (abs_sum < 1.0) abs_sum = 1.0;
+
+        const remaining_samples = total_samples - (order: f64);
+        const mae = abs_sum / remaining_samples;
+
+        const entropy_score = remaining_samples * math::log2f64(mae);
+        const warmup_penalty = (order: f64) * (bps: f64);
+        const total_score = entropy_score + warmup_penalty;
+
+        if (total_score < best_score) {
+            best_score = total_score;
+            selected_method_order = order;
+            is_fixed = true;
+        };
+    };
+
+    // Evaluate Custom LPC Predictors (Orders 1 to 12)
     lpc::window_hann(clean_samples[..len(samples)], windowed[..len(samples)]);
     lpc::autocorrelation(windowed[..len(samples)], R[..]);
-    lpc::levinson_durbin(R[..], lpc_coefs[..]);
+    lpc::levinson_durbin(R[..], full_lpc_coefs[..]);
 
     const precision = 12u8;
-    const shift = lpc::quantize(lpc_coefs[..], q_lpc[..], precision);
+    for (let order = 1z; order <= 12z; order += 1) {
+        let test_q_lpc: [12]i32 = [0...];
+        const current_coefs = full_lpc_coefs[..order];
+        const current_q_target = test_q_lpc[..order];
 
-    lpc::predict_lpc(clean_samples[..len(samples)], q_lpc[..], shift, residual[..len(samples)]);
+        const shift = lpc::quantize(current_coefs, current_q_target, precision);
+        lpc::predict_lpc(clean_samples[..len(samples)], current_q_target, shift, residual[..len(samples)]);
+
+        let abs_sum = 0.0f64;
+        for (let i = order; i < len(samples); i += 1) {
+            abs_sum += math::absf64(residual[i]: f64);
+        };
+        if (abs_sum < 1.0) abs_sum = 1.0;
+
+        const remaining_samples = total_samples - (order: f64);
+        const mae = abs_sum / remaining_samples;
+
+        const entropy_score = remaining_samples * math::log2f64(mae);
+        const warmup_penalty = (order: f64) * (bps: f64);
+        const coefficient_bits = (order: f64) * (precision: f64);
+        const container_floor = 14.0f64;
+
+        const total_score = entropy_score + warmup_penalty + coefficient_bits + container_floor;
+
+        if (total_score < best_score) {
+            best_score = total_score;
+            selected_method_order = order;
+            best_shift = shift;
+            best_q_lpc[..order] = test_q_lpc[..order];
+            is_fixed = false;
+        };
+    };
+
+    if (is_fixed) {
+        const bits = flac::write_subframe_lpc(w, clean_samples[..len(samples)], [], 0, bps)?;
+        return bits;
+    };
 
     const bits = flac::write_subframe_lpc(
         w,
         clean_samples[..len(samples)],
-        q_lpc[..],
-        shift,
+        best_q_lpc[..selected_method_order],
+        best_shift,
         bps,
     )?;
     return bits;
