@@ -32,19 +32,33 @@ export fn write_frame_header(
     channels: u8,
     frame_num: u32,
 ) (size | io::error) = {
+    const chan_code = if (channels == 2) 0b0001u8 else 0b0000u8;
+    return write_frame_header_ext(w, block_size, sample_rate, bps, chan_code, frame_num);
+};
+
+// Extended frame header function that explicitly accepts channel assignment codes
+// for joint stereo configurations and handles variable block streaming.
+export fn write_frame_header_ext(
+    w: *bit_writer,
+    block_size: u16,
+    sample_rate: u32,
+    bps: u8,
+    channel_assignment: u8,
+    frame_num: u32,
+) (size | io::error) = {
     let total_bits = 0z;
     reset_crc8(w);
 
-    // 1. Sync + Reserved + Blocking (0 = Fixed)
+    // 1. Sync (14 bits) + Reserved (1 bit) + Blocking Strategy (1 bit)
     total_bits += write_bits(w, 0x3FFE, 14)?;
-    total_bits += write_bits(w, 0, 2)?;
+    total_bits += write_bits(w, 0, 1)?;
+    total_bits += write_bits(w, 0, 1)?;
 
     // 2. Block size code
-    // Use 0b1100 for 4096, otherwise use 0b0111 for a 16-bit literal
     const bs_code = if (block_size == 4096) 0b1100u64 else 0b0111u64;
     total_bits += write_bits(w, bs_code, 4)?;
 
-    // 3. Sample rate code (dynamic now)
+    // 3. Sample rate code
     const sr_code: u64 = switch (sample_rate) {
         case 8000  => yield 0b0100;
         case 16000 => yield 0b0101;
@@ -62,8 +76,7 @@ export fn write_frame_header(
     total_bits += write_bits(w, sr_code, 4)?;
 
     // 4. Channel Assignment
-    const chan_code = if (channels == 2) 0b0001u64 else 0b0000u64;
-    total_bits += write_bits(w, chan_code, 4)?;
+    total_bits += write_bits(w, channel_assignment: u64, 4)?;
 
     // 5. Sample Size + Reserved
     const sz_code = if (bps == 16) 0b100u64 else 0b110u64;
@@ -73,6 +86,7 @@ export fn write_frame_header(
     // 6. Frame Number
     total_bits += write_utf8_int(w, frame_num: u64)?;
 
+    // 7. Explicit block size trailer if code requires 16-bit literal tracking
     if (bs_code == 0b0111) {
         total_bits += write_bits(w, (block_size - 1): u64, 16)?;
     };
@@ -84,7 +98,6 @@ export fn write_frame_header(
     };
 
     const header_crc = w.crc8;
-
     total_bits += write_bits(w, header_crc: u64, 8)?;
     return total_bits;
 };
