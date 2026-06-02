@@ -68,4 +68,9 @@ The codec follows the standard FLAC analysis flow:
 
 ## Notes
 
-- This project is entirely a lesson for myself, learning about audio encoding, decoding, the FLAC specification as a whole & the Hare language. It should be treated as no more than a learning repo at this point.
+- This project is to learn about audio encoding, decoding, the FLAC specification as a whole & the Hare language.
+
+In it's current state, it can be used reliably. I've personally tested ~100 songs of various sample rates, 
+bit depths etc. & all encode without issue. With this said, compression ratios are subpar compared to 
+libFLAC & ffmpeg (within ~5% on average however) & encoding speeds are also slower. I plan to optimize them
+to make hare-flac competitive against these reference designs.
