@@ -150,9 +150,9 @@ export fn main() void = {
 
 fn encode_channel(w: *flac::bit_writer, samples: []i32, bps: u8) (size | io::error) = {
     let windowed: [4096]f64 = [0.0f64...];
-    let R: [9]f64 = [0.0...];
-    let lpc_coefs: [8]f64 = [0.0...];
-    let q_lpc: [8]i32 = [0...];
+    let R: [13]f64 = [0.0...];
+    let lpc_coefs: [12]f64 = [0.0...];
+    let q_lpc: [12]i32 = [0...];
     let residual: [4096]i32 = [0...];
 
     let clean_samples: [4096]i32 = [0...];
@@ -165,7 +165,7 @@ fn encode_channel(w: *flac::bit_writer, samples: []i32, bps: u8) (size | io::err
     lpc::autocorrelation(windowed[..len(samples)], R[..]);
     lpc::levinson_durbin(R[..], lpc_coefs[..]);
 
-    const precision = if (bps >= 24) 11u8 else 12u8;
+    const precision = 12u8;
     const shift = lpc::quantize(lpc_coefs[..], q_lpc[..], precision);
 
     lpc::predict_lpc(clean_samples[..len(samples)], q_lpc[..], shift, residual[..len(samples)]);
