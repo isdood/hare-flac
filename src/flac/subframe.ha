@@ -102,6 +102,19 @@ fn write_subframe_verbatim(
 	return total_bits;
 };
 
+export fn write_subframe_constant(
+    w: *bit_writer,
+    value: i32,
+    bps: u8,
+) (size | io::error) = {
+    let total_bits = 0z;
+    // Subframe type 0b000000, wasted bits flag 0 = 0x00
+    total_bits += write_bits(w, 0x00, 8)?;
+    const val_u64 = value: i64: u64;
+    total_bits += write_bits(w, val_u64, bps)?;
+    return total_bits;
+};
+
 fn best_partition_order(residuals: []i32, predictor_order: u8) u8 = {
     const n = len(residuals);
     const block_size = n + predictor_order: size;

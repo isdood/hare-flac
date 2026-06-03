@@ -18,11 +18,7 @@ export fn optimize_rice(res: []i32) u8 = {
     const avg = sum: f64 / len(res): f64;
     if (avg <= 0.0) return 0;
 
-    let s = (math::log2f64(avg * 0.6931) + 0.5): i32;
-
-    // SAFETY VALVE: If the average residual is huge,
-    // we MUST use a larger s to keep the quotient 'q' small.
-    if (avg > 1024.0 && s < 10) s = 10;
+    let s = (math::log2f64(avg / 1.3863) + 0.5): i32;
 
     if (s < 0) s = 0;
     if (s > 14) s = 14;

@@ -224,6 +224,18 @@ fn encode_channel(w: *flac::bit_writer, samples: []i32, bps: u8) (size | io::err
 
         const total_score = entropy_score + warmup_penalty + coefficient_bits + container_floor;
 
+        // Constant subframe: all samples identical
+        let is_constant = true;
+        for (let i = 1z; i < len(samples); i += 1) {
+            if (clean_samples[i] != clean_samples[0]) {
+                is_constant = false;
+                break;
+            };
+        };
+        if (is_constant) {
+            return flac::write_subframe_constant(w, clean_samples[0], bps)?;
+        };
+
         if (total_score < best_score) {
             best_score = total_score;
             selected_method_order = order;
