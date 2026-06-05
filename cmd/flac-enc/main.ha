@@ -12,7 +12,7 @@ use strings;
 use strconv;
 
 def MAX_BLOCK: size = 4096;
-def N_WORKERS: size = 16;
+def N_WORKERS: size = 32;
 
 export fn main() void = {
 	const args = os::args;
@@ -141,8 +141,9 @@ export fn main() void = {
 		};
 	};
 
-	const end_time = time::now(time::clock::MONOTONIC);
-	const elapsed  = time::diff(start_time, end_time) / time::SECOND;
+	const elapsed_ns = time::diff(start_time, time::now(time::clock::MONOTONIC));
+    const elapsed_s  = elapsed_ns / time::SECOND;
+    const elapsed_ms = (elapsed_ns % time::SECOND) / time::MILLISECOND;
 
 	// Stitch: STREAMINFO followed by each chunk in order.
 	const out_file = match (os::create(output_path, 0o644)) {
@@ -172,7 +173,9 @@ export fn main() void = {
 		os::remove(out_path)!;
 	};
 
-	fmt::printfln("Encoded {} frames in {}s", total_frames, elapsed)!;
+	fmt::printfln("Encoded {} frames in {}.{}{}s", total_frames, elapsed_s,
+    if (elapsed_ms < 10) "00" else if (elapsed_ms < 100) "0" else "",
+    elapsed_ms)!;
 };
 
 // run_worker reads a raw sample chunk, encodes it to raw FLAC frames, and exits.
