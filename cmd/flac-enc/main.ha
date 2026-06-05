@@ -12,27 +12,26 @@ use strings;
 use strconv;
 
 def MAX_BLOCK: size = 4096;
-
-def CHUNK0_IN:  str = "/tmp/flac-chunk-0.raw";
-def CHUNK1_IN:  str = "/tmp/flac-chunk-1.raw";
-def CHUNK0_OUT: str = "/tmp/flac-out-0.raw";
-def CHUNK1_OUT: str = "/tmp/flac-out-1.raw";
+def N_WORKERS: size = 16;
 
 export fn main() void = {
 	const args = os::args;
 
+	// Worker mode:
+	//   flac-enc --worker <start_frame> <frame_count> <channels> <bps> <sample_rate> <input> <output>
 	if (len(args) >= 2 && args[1] == "--worker") {
-		if (len(args) < 7) {
+		if (len(args) < 9) {
 			fmt::fatal("Usage: flac-enc --worker <start_frame> <frame_count> <channels> <bps> <sample_rate> <input> <output>");
 		};
 		run_worker(args);
 		return;
 	};
 
+	// Orchestrator mode:
+	//   flac-enc <input.wav> <output.flac>
 	if (len(args) < 3) {
 		fmt::fatal("Usage: flac-enc <input.wav> <output.flac>");
 	};
-
 	const input_path  = args[1];
 	const output_path = args[2];
 
@@ -54,6 +53,7 @@ export fn main() void = {
 	const bytes_per_sample = (dec.meta.bit_depth / 8): u32;
 	const total_samples    = dec.data_size / (dec.meta.channels: u32 * bytes_per_sample);
 
+	// Read all samples into a flat buffer upfront.
 	let all_samples: []i32 = alloc([0i32...], total_samples: size * channels) as []i32;
 	defer free(all_samples);
 
@@ -68,66 +68,83 @@ export fn main() void = {
 		n_read += batch;
 	};
 
-	const total_frames  = (n_read + MAX_BLOCK * channels - 1) / (MAX_BLOCK * channels);
-	const split_frame   = total_frames / 2;
-	const split_sample  = split_frame * MAX_BLOCK * channels;
-	const actual_split  = if (split_sample > n_read) n_read else split_sample;
+	const total_frames = (n_read + MAX_BLOCK * channels - 1) / (MAX_BLOCK * channels);
 
-	fmt::printfln("Encoding audio...")!;
-
-	write_raw_samples(CHUNK0_IN, all_samples[..actual_split]);
-	write_raw_samples(CHUNK1_IN, all_samples[actual_split..n_read]);
+	// Shared string args passed to every worker.
+	let channels_str = strings::dup(strconv::u32tos(channels: u32)) as str;
+	defer free(channels_str);
+	let bps_str      = strings::dup(strconv::u32tos(bps: u32)) as str;
+	defer free(bps_str);
+	let rate_str     = strings::dup(strconv::u32tos(dec.meta.rate)) as str;
+	defer free(rate_str);
 
 	const self_path = os::args[0];
 
-	let start_frame_0 = strings::dup(strconv::u32tos(0u32)) as str;
-	defer free(start_frame_0);
-	let frame_count_0 = strings::dup(strconv::u32tos(split_frame: u32)) as str;
-	defer free(frame_count_0);
-	let start_frame_1 = strings::dup(strconv::u32tos(split_frame: u32)) as str;
-	defer free(start_frame_1);
-	let frame_count_1 = strings::dup(strconv::u32tos((total_frames - split_frame): u32)) as str;
-	defer free(frame_count_1);
-	let channels_str  = strings::dup(strconv::u32tos(channels: u32)) as str;
-	defer free(channels_str);
-	let bps_str       = strings::dup(strconv::u32tos(bps: u32)) as str;
-	defer free(bps_str);
-	let rate_str      = strings::dup(strconv::u32tos(dec.meta.rate)) as str;
-	defer free(rate_str);
+	// Compute per-worker frame boundaries and write input chunks.
+	// Frame counts are distributed as evenly as possible; the final worker
+	// absorbs any remainder.
+	let start_frames: [N_WORKERS]u32 = [0...];
+	let frame_counts: [N_WORKERS]u32 = [0...];
+	const base_frames    = total_frames / N_WORKERS;
+	const remainder      = total_frames % N_WORKERS;
 
+	for (let i = 0z; i < N_WORKERS; i += 1) {
+		const extra = if (i < remainder) 1z else 0z;
+		frame_counts[i] = (base_frames + extra): u32;
+		start_frames[i] = if (i == 0) 0u32
+			else start_frames[i - 1] + frame_counts[i - 1];
+
+		const sample_start = start_frames[i]: size * MAX_BLOCK * channels;
+		const sample_end_frames = (start_frames[i] + frame_counts[i]): size;
+		const sample_end = if (sample_end_frames * MAX_BLOCK * channels > n_read)
+			n_read
+		else
+			sample_end_frames * MAX_BLOCK * channels;
+
+		let in_path = fmt::asprint("/tmp/flac-chunk-{}.raw", i) as str;
+		defer free(in_path);
+		write_raw_samples(in_path, all_samples[sample_start..sample_end]);
+	};
+
+	fmt::printfln("Encoding audio...")!;
 	const start_time = time::now(time::clock::MONOTONIC);
 
-	const cmd0 = exec::cmd(self_path,
-		"--worker",
-		start_frame_0, frame_count_0,
-		channels_str, bps_str, rate_str,
-		CHUNK0_IN, CHUNK0_OUT)!;
-	let proc0 = exec::start(&cmd0)!;
+	// Spawn all workers.
+	let procs: []exec::process = [];
+	defer free(procs);
+	    for (let i = 0z; i < N_WORKERS; i += 1) {
+		let sf_str   = strings::dup(strconv::u32tos(start_frames[i])) as str;
+		defer free(sf_str);
+		let fc_str   = strings::dup(strconv::u32tos(frame_counts[i])) as str;
+		defer free(fc_str);
+		let in_path  = fmt::asprint("/tmp/flac-chunk-{}.raw", i) as str;
+		defer free(in_path);
+		let out_path = fmt::asprint("/tmp/flac-out-{}.raw", i) as str;
+		defer free(out_path);
 
-	const cmd1 = exec::cmd(self_path,
-		"--worker",
-		start_frame_1, frame_count_1,
-		channels_str, bps_str, rate_str,
-		CHUNK1_IN, CHUNK1_OUT)!;
-	let proc1 = exec::start(&cmd1)!;
+		const cmd = exec::cmd(self_path,
+			"--worker",
+			sf_str, fc_str,
+			channels_str, bps_str, rate_str,
+			in_path, out_path)!;
+		const proc = exec::start(&cmd)!;
+		append(procs, proc)!;
+};
 
-	const status0 = exec::wait(&proc0)!;
-	const status1 = exec::wait(&proc1)!;
-
-	match (exec::check(&status0)) {
-		case void => void;
-		case let s: !exec::exit_status =>
-			fmt::fatalf("Worker 0 failed: {}", exec::exitstr(s));
-	};
-	match (exec::check(&status1)) {
-		case void => void;
-		case let s: !exec::exit_status =>
-			fmt::fatalf("Worker 1 failed: {}", exec::exitstr(s));
+	// Wait for all workers.
+	for (let i = 0z; i < N_WORKERS; i += 1) {
+		const status = exec::wait(&procs[i])!;
+		match (exec::check(&status)) {
+			case void => void;
+			case let s: !exec::exit_status =>
+				fmt::fatalf("Worker {} failed: {}", i, exec::exitstr(s));
+		};
 	};
 
 	const end_time = time::now(time::clock::MONOTONIC);
 	const elapsed  = time::diff(start_time, end_time) / time::SECOND;
 
+	// Stitch: STREAMINFO followed by each chunk in order.
 	const out_file = match (os::create(output_path, 0o644)) {
 		case let f: io::file => yield f;
 		case let e: fs::error =>
@@ -139,19 +156,28 @@ export fn main() void = {
 	flac::write_stream_header(&writer, &dec)!;
 	flac::flush(&writer)!;
 
-	append_file(out_file, CHUNK0_OUT);
-	append_file(out_file, CHUNK1_OUT);
+	for (let i = 0z; i < N_WORKERS; i += 1) {
+		let out_path = fmt::asprint("/tmp/flac-out-{}.raw", i) as str;
+		defer free(out_path);
+		append_file(out_file, out_path);
+	};
 
-	os::remove(CHUNK0_IN)!;
-	os::remove(CHUNK1_IN)!;
-	os::remove(CHUNK0_OUT)!;
-	os::remove(CHUNK1_OUT)!;
+	// Clean up temp files.
+	for (let i = 0z; i < N_WORKERS; i += 1) {
+		let in_path  = fmt::asprint("/tmp/flac-chunk-{}.raw", i) as str;
+		defer free(in_path);
+		let out_path = fmt::asprint("/tmp/flac-out-{}.raw", i) as str;
+		defer free(out_path);
+		os::remove(in_path)!;
+		os::remove(out_path)!;
+	};
 
 	fmt::printfln("Encoded {} frames in {}s", total_frames, elapsed)!;
 };
 
-// run_worker is invoked as a subprocess to encode one chunk of samples.
+// run_worker reads a raw sample chunk, encodes it to raw FLAC frames, and exits.
 // Args: --worker <start_frame> <frame_count> <channels> <bps> <sample_rate> <input> <output>
+//          [1]       [2]           [3]          [4]      [5]      [6]          [7]     [8]
 fn run_worker(args: []str) void = {
 	const start_frame = strconv::stou32(args[2]) as u32;
 	const frame_count = strconv::stou32(args[3]) as u32;
@@ -160,6 +186,7 @@ fn run_worker(args: []str) void = {
 	const sample_rate = strconv::stou32(args[6]) as u32;
 	const input_path  = args[7];
 	const output_path = args[8];
+	let _ = frame_count;
 
 	const in_file = match (os::open(input_path)) {
 		case let f: io::file => yield f;
@@ -191,7 +218,6 @@ fn run_worker(args: []str) void = {
 
 	let writer = flac::newwriter(out_file);
 	encode_chunk(&writer, samples, channels, bps, sample_rate, start_frame);
-	let _ = frame_count;
 };
 
 // encode_chunk encodes samples into raw FLAC frames (no STREAMINFO header).
@@ -215,7 +241,7 @@ fn encode_chunk(
 	let pos = 0z;
 
 	for (pos < len(all_samples)) {
-		const remaining    = len(all_samples) - pos;
+		const remaining     = len(all_samples) - pos;
 		const block_samples = if (remaining > MAX_BLOCK * channels)
 			MAX_BLOCK * channels
 		else
@@ -325,10 +351,10 @@ fn encode_channel(w: *flac::bit_writer, samples: []i32, bps: u8) (size | io::err
 		clean_samples[i] = (samples[i] << shift_bits) >> shift_bits;
 	};
 
-	let best_score           = math::INF;
-	let best_shift           = 0u8;
-	let best_q_lpc:   [12]i32 = [0...];
-	let is_fixed             = true;
+	let best_score            = math::INF;
+	let best_shift            = 0u8;
+	let best_q_lpc:    [12]i32 = [0...];
+	let is_fixed              = true;
 	let selected_method_order: size = 0z;
 
 	const total_samples = len(samples): f64;
