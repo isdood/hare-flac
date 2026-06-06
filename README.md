@@ -70,9 +70,7 @@ The codec follows the standard FLAC analysis flow:
 
 - This project is to learn about audio encoding, decoding, the FLAC specification as a whole & the Hare language.
 
-In it's current state, it can be used reliably. I've personally tested ~100 songs of various sample rates, 
-bit depths etc. & all encode without issue (note recent changes are a bit less tested). Compression ratios 
-are comparable to libFLAC & ffmpeg (within ~2% on average, though some tracks compress to an equal size). 
-Depending on core count, encoding speeds are comparable, notably at 32 workers a 7 minute track encodes
-in less than a second & just above a second at 16 workers. With a 9950X (16 cores) 32 workers basically 
-maxs out CPU usage, so care when setting N_WORKERS.
+The recent changes surrounding multi-processing are experimental, though I haven't encountered
+any issues yet. Compression ratios are comparable to libFLAC & ffmpeg (within ~2% on average, 
+though some tracks compress to an equal size). Depending on core count, encoding speeds are comparable, 
+notably at 32 workers a 7 minute track encodes in less than a second (9950X CPU).

@@ -10,18 +10,23 @@ use time;
 use math;
 use strings;
 use strconv;
+use errors;
 
 def MAX_BLOCK: size = 4096;
-def N_WORKERS: size = 32;
+
+// Child fd slots for memfd IPC.
+def WORKER_IN_FD:  int = 3;
+def WORKER_OUT_FD: int = 4;
 
 export fn main() void = {
 	const args = os::args;
 
 	// Worker mode:
-	//   flac-enc --worker <start_frame> <frame_count> <channels> <bps> <sample_rate> <input> <output>
+	//   flac-enc --worker <start_frame> <channels> <bps> <sample_rate>
+	//   fd 3 = input PCM memfd, fd 4 = output FLAC memfd
 	if (len(args) >= 2 && args[1] == "--worker") {
-		if (len(args) < 9) {
-			fmt::fatal("Usage: flac-enc --worker <start_frame> <frame_count> <channels> <bps> <sample_rate> <input> <output>");
+		if (len(args) < 6) {
+			fmt::fatal("Usage: flac-enc --worker <start_frame> <channels> <bps> <sample_rate>");
 		};
 		run_worker(args);
 		return;
@@ -34,6 +39,11 @@ export fn main() void = {
 	};
 	const input_path  = args[1];
 	const output_path = args[2];
+
+	const n_workers = match (os::cpucount()) {
+		case let n: size => yield n;
+		case => yield 1z;
+	};
 
 	const file = match (os::open(input_path)) {
 		case let f: io::file => yield f;
@@ -80,59 +90,86 @@ export fn main() void = {
 
 	const self_path = os::args[0];
 
-	// Compute per-worker frame boundaries and write input chunks.
-	// Frame counts are distributed as evenly as possible; the final worker
-	// absorbs any remainder.
-	let start_frames: [N_WORKERS]u32 = [0...];
-	let frame_counts: [N_WORKERS]u32 = [0...];
-	const base_frames    = total_frames / N_WORKERS;
-	const remainder      = total_frames % N_WORKERS;
+	// Compute per-worker frame boundaries.
+	// Distribute frames as evenly as possible; first `remainder` workers
+	// each get one extra frame.
+	let start_frames: []u32 = alloc([0u32...], n_workers) as []u32;
+	defer free(start_frames);
+	let frame_counts: []u32 = alloc([0u32...], n_workers) as []u32;
+	defer free(frame_counts);
 
-	for (let i = 0z; i < N_WORKERS; i += 1) {
+	const base_frames = total_frames / n_workers;
+	const remainder   = total_frames % n_workers;
+
+	for (let i = 0z; i < n_workers; i += 1) {
 		const extra = if (i < remainder) 1z else 0z;
 		frame_counts[i] = (base_frames + extra): u32;
 		start_frames[i] = if (i == 0) 0u32
 			else start_frames[i - 1] + frame_counts[i - 1];
+	};
 
-		const sample_start = start_frames[i]: size * MAX_BLOCK * channels;
+	// Create memfds for each worker and write PCM input chunks.
+	// Retain the output memfds for stitching after workers finish.
+	let in_fds:  []io::file = alloc([0: io::file...], n_workers) as []io::file;
+	defer free(in_fds);
+	let out_fds: []io::file = alloc([0: io::file...], n_workers) as []io::file;
+	defer free(out_fds);
+
+	for (let i = 0z; i < n_workers; i += 1) {
+		const sample_start      = start_frames[i]: size * MAX_BLOCK * channels;
 		const sample_end_frames = (start_frames[i] + frame_counts[i]): size;
-		const sample_end = if (sample_end_frames * MAX_BLOCK * channels > n_read)
+		const sample_end        = if (sample_end_frames * MAX_BLOCK * channels > n_read)
 			n_read
 		else
 			sample_end_frames * MAX_BLOCK * channels;
 
-		let in_path = fmt::asprint("/tmp/flac-chunk-{}.raw", i) as str;
-		defer free(in_path);
-		write_raw_samples(in_path, all_samples[sample_start..sample_end]);
+		const in_fd = match (os::memfd("flac-chunk")) {
+			case let f: io::file => yield f;
+			case let e: errors::error =>
+				fmt::fatalf("memfd failed: {}", errors::strerror(e));
+		};
+		const out_fd = match (os::memfd("flac-out")) {
+			case let f: io::file => yield f;
+			case let e: errors::error =>
+				fmt::fatalf("memfd failed: {}", errors::strerror(e));
+		};
+
+		// Write PCM chunk into input memfd, then seek back for the child.
+		write_raw_samples_fd(in_fd, all_samples[sample_start..sample_end]);
+		io::seek(in_fd, 0, io::whence::SET)!;
+
+		in_fds[i]  = in_fd;
+		out_fds[i] = out_fd;
 	};
 
 	fmt::printfln("Encoding audio...")!;
 	const start_time = time::now(time::clock::MONOTONIC);
 
-	// Spawn all workers.
+	// Spawn all workers, wiring memfds into child fd slots 3 and 4.
 	let procs: []exec::process = [];
 	defer free(procs);
-	    for (let i = 0z; i < N_WORKERS; i += 1) {
-		let sf_str   = strings::dup(strconv::u32tos(start_frames[i])) as str;
+	for (let i = 0z; i < n_workers; i += 1) {
+		let sf_str = strings::dup(strconv::u32tos(start_frames[i])) as str;
 		defer free(sf_str);
-		let fc_str   = strings::dup(strconv::u32tos(frame_counts[i])) as str;
-		defer free(fc_str);
-		let in_path  = fmt::asprint("/tmp/flac-chunk-{}.raw", i) as str;
-		defer free(in_path);
-		let out_path = fmt::asprint("/tmp/flac-out-{}.raw", i) as str;
-		defer free(out_path);
 
-		const cmd = exec::cmd(self_path,
+		let cmd = exec::cmd(self_path,
 			"--worker",
-			sf_str, fc_str,
-			channels_str, bps_str, rate_str,
-			in_path, out_path)!;
+			sf_str,
+			channels_str, bps_str, rate_str)!;
+		exec::addfile(&cmd, WORKER_IN_FD,  in_fds[i])!;
+		exec::addfile(&cmd, WORKER_OUT_FD, out_fds[i])!;
+
 		const proc = exec::start(&cmd)!;
 		append(procs, proc)!;
-};
+	};
+
+	// Close input memfds in the parent — workers have their own copies.
+	for (let i = 0z; i < n_workers; i += 1) {
+		io::close(in_fds[i])!;
+	};
 
 	// Wait for all workers.
-	for (let i = 0z; i < N_WORKERS; i += 1) {
+	for (let i = 0z; i < n_workers; i += 1) {
 		const status = exec::wait(&procs[i])!;
 		match (exec::check(&status)) {
 			case void => void;
@@ -142,10 +179,11 @@ export fn main() void = {
 	};
 
 	const elapsed_ns = time::diff(start_time, time::now(time::clock::MONOTONIC));
-    const elapsed_s  = elapsed_ns / time::SECOND;
-    const elapsed_ms = (elapsed_ns % time::SECOND) / time::MILLISECOND;
+	const elapsed_s  = elapsed_ns / time::SECOND;
+	const elapsed_ms = (elapsed_ns % time::SECOND) / time::MILLISECOND;
 
 	// Stitch: STREAMINFO followed by each chunk in order.
+	// Seek each output memfd back to start before copying.
 	const out_file = match (os::create(output_path, 0o644)) {
 		case let f: io::file => yield f;
 		case let e: fs::error =>
@@ -157,67 +195,48 @@ export fn main() void = {
 	flac::write_stream_header(&writer, &dec)!;
 	flac::flush(&writer)!;
 
-	for (let i = 0z; i < N_WORKERS; i += 1) {
-		let out_path = fmt::asprint("/tmp/flac-out-{}.raw", i) as str;
-		defer free(out_path);
-		append_file(out_file, out_path);
-	};
-
-	// Clean up temp files.
-	for (let i = 0z; i < N_WORKERS; i += 1) {
-		let in_path  = fmt::asprint("/tmp/flac-chunk-{}.raw", i) as str;
-		defer free(in_path);
-		let out_path = fmt::asprint("/tmp/flac-out-{}.raw", i) as str;
-		defer free(out_path);
-		os::remove(in_path)!;
-		os::remove(out_path)!;
+	for (let i = 0z; i < n_workers; i += 1) {
+		io::seek(out_fds[i], 0, io::whence::SET)!;
+		io::copy(out_file, out_fds[i])!;
+		io::close(out_fds[i])!;
 	};
 
 	fmt::printfln("Encoded {} frames in {}.{}{}s", total_frames, elapsed_s,
-    if (elapsed_ms < 10) "00" else if (elapsed_ms < 100) "0" else "",
-    elapsed_ms)!;
+		if (elapsed_ms < 10) "00" else if (elapsed_ms < 100) "0" else "",
+		elapsed_ms)!;
 };
 
-// run_worker reads a raw sample chunk, encodes it to raw FLAC frames, and exits.
-// Args: --worker <start_frame> <frame_count> <channels> <bps> <sample_rate> <input> <output>
-//          [1]       [2]           [3]          [4]      [5]      [6]          [7]     [8]
+// run_worker reads PCM from fd 3 via mmap, encodes to FLAC frames, writes
+// to fd 4, and exits.
+// Args: --worker <start_frame> <channels> <bps> <sample_rate>
+//          [1]       [2]          [3]      [4]      [5]
 fn run_worker(args: []str) void = {
 	const start_frame = strconv::stou32(args[2]) as u32;
-	const frame_count = strconv::stou32(args[3]) as u32;
-	const channels    = (strconv::stou32(args[4]) as u32): size;
-	const bps         = (strconv::stou32(args[5]) as u32): u8;
-	const sample_rate = strconv::stou32(args[6]) as u32;
-	const input_path  = args[7];
-	const output_path = args[8];
-	let _ = frame_count;
+	const channels    = (strconv::stou32(args[3]) as u32): size;
+	const bps         = (strconv::stou32(args[4]) as u32): u8;
+	const sample_rate = strconv::stou32(args[5]) as u32;
 
-	const in_file = match (os::open(input_path)) {
-		case let f: io::file => yield f;
-		case let e: fs::error =>
-			fmt::fatalf("Worker: error opening input {}: {}", input_path, fs::strerror(e));
+	// fd 3 and 4 are wired up by the orchestrator via exec::addfile.
+	const in_file  = io::fdopen(WORKER_IN_FD);
+	const out_file = io::fdopen(WORKER_OUT_FD);
+
+	// mmap the input memfd — page-aligned pointer makes the i32
+	// reinterpret safe, and avoids any allocation or copy.
+	const file_size = io::seek(in_file, 0, io::whence::END)!: size;
+	io::seek(in_file, 0, io::whence::SET)!;
+
+	const ptr = match (io::mmap(null, file_size,
+			io::prot::READ,
+			io::mflag::PRIVATE,
+			in_file, 0)) {
+		case let p: *opaque => yield p;
+		case let e: errors::error =>
+			fmt::fatalf("Worker: mmap failed: {}", errors::strerror(e));
 	};
-	defer io::close(in_file)!;
+	defer io::munmap(ptr, file_size)!;
 
-	const raw_bytes = io::drain(in_file)!;
-	defer free(raw_bytes);
-
-	const n_samples = len(raw_bytes) / 4;
-	let samples: []i32 = alloc([0i32...], n_samples) as []i32;
-	defer free(samples);
-	for (let i = 0z; i < n_samples; i += 1) {
-		const b = raw_bytes[i * 4..(i + 1) * 4];
-		samples[i] = (b[0]: i32)
-			| ((b[1]: i32) << 8)
-			| ((b[2]: i32) << 16)
-			| ((b[3]: i32) << 24);
-	};
-
-	const out_file = match (os::create(output_path, 0o644)) {
-		case let f: io::file => yield f;
-		case let e: fs::error =>
-			fmt::fatalf("Worker: error creating output {}: {}", output_path, fs::strerror(e));
-	};
-	defer io::close(out_file)!;
+	const n_samples = file_size / 4;
+	const samples   = (ptr: *[*]i32)[..n_samples];
 
 	let writer = flac::newwriter(out_file);
 	encode_chunk(&writer, samples, channels, bps, sample_rate, start_frame);
@@ -318,28 +337,10 @@ fn encode_chunk(
 	flac::finalize_frame(writer);
 };
 
-// write_raw_samples writes a []i32 to a file as little-endian bytes.
-fn write_raw_samples(path: str, samples: []i32) void = {
-	const f = match (os::create(path, 0o644)) {
-		case let f: io::file => yield f;
-		case let e: fs::error =>
-			fmt::fatalf("Error creating {}: {}", path, fs::strerror(e));
-	};
-	defer io::close(f)!;
-
+// write_raw_samples_fd writes a []i32 to an io::file as bulk little-endian bytes.
+fn write_raw_samples_fd(fd: io::file, samples: []i32) void = {
 	const bytes = samples: *[*]u8;
-	io::writeall(f, bytes[..len(samples) * 4])!;
-};
-
-// append_file copies all bytes from src into dst.
-fn append_file(dst: io::file, src_path: str) void = {
-	const src = match (os::open(src_path)) {
-		case let f: io::file => yield f;
-		case let e: fs::error =>
-			fmt::fatalf("Error opening {} for stitch: {}", src_path, fs::strerror(e));
-	};
-	defer io::close(src)!;
-	io::copy(dst, src)!;
+	io::writeall(fd, bytes[..len(samples) * 4])!;
 };
 
 fn encode_channel(w: *flac::bit_writer, samples: []i32, bps: u8) (size | io::error) = {
@@ -354,10 +355,10 @@ fn encode_channel(w: *flac::bit_writer, samples: []i32, bps: u8) (size | io::err
 		clean_samples[i] = (samples[i] << shift_bits) >> shift_bits;
 	};
 
-	let best_score            = math::INF;
-	let best_shift            = 0u8;
-	let best_q_lpc:    [12]i32 = [0...];
-	let is_fixed              = true;
+	let best_score             = math::INF;
+	let best_shift             = 0u8;
+	let best_q_lpc:     [12]i32 = [0...];
+	let is_fixed               = true;
 	let selected_method_order: size = 0z;
 
 	const total_samples = len(samples): f64;
