@@ -18,3 +18,7 @@ encoded and played back without issue.
 
 I'm testing this on a machine with 16 cores (32 threads), DDR5 RAM & NVME storage.
 Performance characteristics and design choices were decided with these in mind.
+Encoding speeds drastically differ depending on core count, lower powered & low core count devices
+will have hugely slower encoding speeds. I've done some testing on a smaller 4-core device
+& it's pretty slow. I'll probably optimize for such devices eventually, though it isn't a primary
+focus.
