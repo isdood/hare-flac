@@ -53,6 +53,53 @@ export fn write_rice(w: *bit_writer, val: i32, s: u8) (size | io::error) = {
     return bits;
 };
 
+// Maps an unsigned zigzag integer back to a signed integer.
+fn un_zig_zag(u: u32) i32 = {
+    return ((u >> 1): i32) ^ -((u & 1): i32);
+};
+
+// Reads a Rice-coded signed integer with parameter `s` from the bit reader.
+export fn read_rice(r: *bit_reader, s: u8) (i32 | io::error | io::EOF) = {
+    const q: u32 = match (read_unary(r)) {
+        case let v: u32 => yield v;
+        case let e: io::error => return e;
+        case io::EOF => return io::EOF;
+    };
+    const rem: u32 = if (s > 0) {
+        yield (read_bits(r, s)?): u32;
+    } else 0u32;
+    const u: u32 = (q << (s: u32)) | rem;
+    return un_zig_zag(u);
+};
+
+@test fn test_rice_roundtrip() void = {
+    // Roundtrip a handful of signed values through write_rice / read_rice.
+    const vals: [_]i32 = [0, 1, -1, 7, -7, 100, -100];
+    const params: [_]u8 = [0, 2, 4];
+
+    for (let pi = 0z; pi < len(params); pi += 1) {
+        const s = params[pi];
+        let buf: [64]u8 = [0...];
+        let wmem = memio::fixed(buf);
+        let w = newwriter(&wmem);
+
+        for (let i = 0z; i < len(vals); i += 1) {
+            write_rice(&w, vals[i], s)!;
+        };
+        flush(&w)!;
+
+        let rmem = memio::fixed(buf);
+        let r = newreader(&rmem);
+        for (let i = 0z; i < len(vals); i += 1) {
+            const got: i32 = match (read_rice(&r, s)) {
+                case let v: i32 => yield v;
+                case => abort("unexpected error or EOF in test");
+            };
+            assert(got == vals[i]);
+        };
+    };
+};
+
 @test fn test_rice_encoding() void = {
     let buf: [16]u8 = [0...];
     let mem = memio::fixed(buf);

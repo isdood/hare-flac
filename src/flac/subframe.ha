@@ -1,3 +1,4 @@
+use errors;
 use io;
 use lpc;
 use memio;
@@ -276,4 +277,244 @@ fn write_residuals(
 	flush(&w)!;
 	assert(bits > 0);
 	assert(buf[0] == 0x40 || (buf[0] >= 0x10 && buf[0] <= 0x1a));
+};
+
+// ---------------------------------------------------------------------------
+// Subframe decoding
+// ---------------------------------------------------------------------------
+
+// Reads and decodes a single FLAC subframe into `out`, which must be
+// pre-allocated to `block_size` samples. `bps` is the effective bits per
+// sample for this subframe (may be bps+1 for the side channel in mid/side).
+export fn read_subframe(
+	r: *bit_reader,
+	out: []i32,
+	bps: u8,
+) (void | io::error | io::EOF) = {
+	const n = len(out);
+
+	// Subframe header byte: reserved(1) | type(6) | wasted_bits_flag(1)
+	const hdr = match (read_bits(r, 8)) {
+		case let v: u64 => yield v;
+		case let e: io::error => return e;
+		case io::EOF => return io::EOF;
+	};
+	// Wasted bits flag: if set, a unary-coded wasted bit count follows.
+	// flac-enc never sets this, but handled to work with generic encoders.
+	let wasted: u8 = 0;
+	if (hdr & 1 == 1) {
+		const w = match (read_unary(r)) {
+			case let v: u32 => yield (v + 1): u8;
+			case let e: io::error => return e;
+			case io::EOF => return io::EOF;
+		};
+		wasted = w;
+	};
+	const effective_bps = bps - wasted;
+
+	const subframe_type = ((hdr >> 1) & 0x3F): u8;
+
+	if (subframe_type == 0b000000) {
+		// Constant subframe: one sample replicated across the block.
+		return read_subframe_constant(r, out, effective_bps, wasted);
+	} else if (subframe_type == 0b000010) {
+		// Verbatim subframe.
+		return read_subframe_verbatim(r, out, effective_bps, wasted);
+	} else if (subframe_type & 0b111000 == 0b001000) {
+		// Fixed predictor subframe: low 3 bits are order.
+		const order = (subframe_type & 0b111): u8;
+		return read_subframe_fixed(r, out, effective_bps, order, wasted);
+	} else if (subframe_type & 0b100000 == 0b100000) {
+		// LPC subframe: low 5 bits are order-1.
+		const order = ((subframe_type & 0b011111) + 1): u8;
+		return read_subframe_lpc(r, out, effective_bps, order, wasted);
+	} else {
+		return errors::invalid;
+	};
+};
+
+fn read_subframe_constant(
+	r: *bit_reader,
+	out: []i32,
+	bps: u8,
+	wasted: u8,
+) (void | io::error | io::EOF) = {
+	const raw = match (read_bits(r, bps)) {
+		case let v: u64 => yield v;
+		case let e: io::error => return e;
+		case io::EOF => return io::EOF;
+	};
+	const value = (sign_extend(raw, bps): u32 << wasted: u32): i32;
+	for (let i = 0z; i < len(out); i += 1) {
+		out[i] = value;
+	};
+};
+
+fn read_subframe_verbatim(
+	r: *bit_reader,
+	out: []i32,
+	bps: u8,
+	wasted: u8,
+) (void | io::error | io::EOF) = {
+	for (let i = 0z; i < len(out); i += 1) {
+		const raw = match (read_bits(r, bps)) {
+			case let v: u64 => yield v;
+			case let e: io::error => return e;
+			case io::EOF => return io::EOF;
+		};
+		out[i] = (sign_extend(raw, bps): u32 << wasted: u32): i32;
+	};
+};
+
+fn read_subframe_fixed(
+	r: *bit_reader,
+	out: []i32,
+	bps: u8,
+	order: u8,
+	wasted: u8,
+) (void | io::error | io::EOF) = {
+	const n = len(out);
+
+	// Warmup samples.
+	for (let i = 0z; i < order: size; i += 1) {
+		const raw = match (read_bits(r, bps)) {
+			case let v: u64 => yield v;
+			case let e: io::error => return e;
+			case io::EOF => return io::EOF;
+		};
+		out[i] = (sign_extend(raw, bps): u32 << wasted: u32): i32;
+	};
+
+	// Residuals into out[order..], then reconstruct in-place.
+	read_residuals(r, out[order..], order)?;
+	lpc::restore_fixed(out, order, out);
+
+	// Apply wasted bits shift if needed.
+	if (wasted > 0) {
+		for (let i = order: size; i < n; i += 1) {
+			out[i] = (out[i]: u32 << wasted: u32): i32;
+		};
+	};
+};
+
+fn read_subframe_lpc(
+	r: *bit_reader,
+	out: []i32,
+	bps: u8,
+	order: u8,
+	wasted: u8,
+) (void | io::error | io::EOF) = {
+	const n = len(out);
+
+	// Warmup samples.
+	for (let i = 0z; i < order: size; i += 1) {
+		const raw = match (read_bits(r, bps)) {
+			case let v: u64 => yield v;
+			case let e: io::error => return e;
+			case io::EOF => return io::EOF;
+		};
+		out[i] = (sign_extend(raw, bps): u32 << wasted: u32): i32;
+	};
+
+	// Coefficient precision (4 bits, stored as precision-1).
+	const prec_raw = match (read_bits(r, 4)) {
+		case let v: u64 => yield v;
+		case let e: io::error => return e;
+		case io::EOF => return io::EOF;
+	};
+	const precision = (prec_raw + 1): u8;
+
+	// Quantization shift (5 bits, signed).
+	const shift_raw = match (read_bits(r, 5)) {
+		case let v: u64 => yield v;
+		case let e: io::error => return e;
+		case io::EOF => return io::EOF;
+	};
+	const shift = shift_raw: u8;
+
+	// Quantized coefficients.
+	let q_lpc: [12]i32 = [0...];
+	for (let i = 0z; i < order: size; i += 1) {
+		const raw = match (read_bits(r, precision)) {
+			case let v: u64 => yield v;
+			case let e: io::error => return e;
+			case io::EOF => return io::EOF;
+		};
+		q_lpc[i] = sign_extend(raw, precision);
+	};
+
+	// Residuals into out[order..].
+	read_residuals(r, out[order..], order)?;
+
+	// Reconstruct via LPC synthesis.
+	lpc::restore_lpc(out, q_lpc[..order], shift, out);
+
+	// Apply wasted bits shift if needed.
+	if (wasted > 0) {
+		for (let i = order: size; i < n; i += 1) {
+			out[i] = (out[i]: u32 << wasted: u32): i32;
+		};
+	};
+};
+
+fn read_residuals(
+	r: *bit_reader,
+	out: []i32,
+	predictor_order: u8,
+) (void | io::error | io::EOF) = {
+	const method = match (read_bits(r, 2)) {
+		case let v: u64 => yield v;
+		case let e: io::error => return e;
+		case io::EOF => return io::EOF;
+	};
+	const param_bits: u8 = if (method == 0) 4 else 5;
+
+	// Partition order: 4 bits.
+	const partition_order = match (read_bits(r, 4)) {
+		case let v: u64 => yield v: u8;
+		case let e: io::error => return e;
+		case io::EOF => return io::EOF;
+	};
+
+	const block_size = len(out) + predictor_order: size;
+	const num_partitions = 1u32 << (partition_order: u32);
+	const part_size = block_size: u32 / num_partitions;
+
+	let pos = 0z;
+	for (let p = 0u32; p < num_partitions; p += 1) {
+		const count: size = if (p == 0)
+			(part_size - predictor_order: u32): size
+		else
+			part_size: size;
+
+		// Rice parameter for this partition.
+		const rice_k = match (read_bits(r, param_bits)) {
+			case let v: u64 => yield v: u8;
+			case let e: io::error => return e;
+			case io::EOF => return io::EOF;
+		};
+
+		for (let i = 0z; i < count; i += 1) {
+			const val = match (read_rice(r, rice_k)) {
+				case let v: i32 => yield v;
+				case let e: io::error => return e;
+				case io::EOF => return io::EOF;
+			};
+			out[pos] = val;
+			pos += 1;
+		};
+	};
+};
+
+// Sign-extends a value read as `bits`-wide unsigned into a signed i32.
+fn sign_extend(val: u64, bits: u8) i32 = {
+	if (bits == 0) return 0;
+	const sign_bit = 1u64 << ((bits - 1): u64);
+	if (val & sign_bit != 0) {
+		// Negative: fill upper bits with 1s.
+		const mask = ~((sign_bit << 1) - 1);
+		return (val | mask): i64: i32;
+	} else {
+		return val: i32;
+	};
 };

@@ -15,5 +15,4 @@ debug.txt
 
 # Root-level binary
 /flac-enc
-
-
+/flac-dec

@@ -17,6 +17,7 @@ def MAX_BLOCK: size = 4096;
 // Child fd slots for memfd IPC.
 def WORKER_IN_FD:  int = 3;
 def WORKER_OUT_FD: int = 4;
+def WORKER_MAP_FD: int = 5;
 
 export fn main() void = {
 	const args = os::args;
@@ -114,6 +115,8 @@ export fn main() void = {
 	defer free(in_fds);
 	let out_fds: []io::file = alloc([0: io::file...], n_workers) as []io::file;
 	defer free(out_fds);
+	let map_fds: []io::file = alloc([0: io::file...], n_workers) as []io::file;
+	defer free(map_fds);
 
 	for (let i = 0z; i < n_workers; i += 1) {
 		const sample_start      = start_frames[i]: size * MAX_BLOCK * channels;
@@ -138,8 +141,14 @@ export fn main() void = {
 		write_raw_samples_fd(in_fd, all_samples[sample_start..sample_end]);
 		io::seek(in_fd, 0, io::whence::SET)!;
 
+		const map_fd = match (os::memfd("flac-map")) {
+			case let f: io::file => yield f;
+			case let e: errors::error =>
+				fmt::fatalf("memfd failed: {}", errors::strerror(e));
+		};
 		in_fds[i]  = in_fd;
 		out_fds[i] = out_fd;
+		map_fds[i] = map_fd;
 	};
 
 	fmt::printfln("Encoding audio...")!;
@@ -158,6 +167,7 @@ export fn main() void = {
 			channels_str, bps_str, rate_str)!;
 		exec::addfile(&cmd, WORKER_IN_FD,  in_fds[i])!;
 		exec::addfile(&cmd, WORKER_OUT_FD, out_fds[i])!;
+		exec::addfile(&cmd, WORKER_MAP_FD, map_fds[i])!;
 
 		const proc = exec::start(&cmd)!;
 		append(procs, proc)!;
@@ -193,7 +203,73 @@ export fn main() void = {
 
 	let writer = flac::newwriter(out_file);
 	flac::write_stream_header(&writer, &dec)!;
-	flac::flush(&writer)!;
+
+	// Compute seektable: one seekpoint every 10 seconds of audio.
+	const seekpoint_interval = dec.meta.rate: size * 10;
+	const n_seekpoints = (total_samples: size + seekpoint_interval - 1) / seekpoint_interval;
+	const seektable_offset = flac::write_seektable_placeholder(
+		&writer, out_file, n_seekpoints: u32)!;
+
+	// Compute header size (magic + STREAMINFO block + SEEKTABLE block).
+	const header_size: u64 = 4 + 4 + 34 + 4 + n_seekpoints: u64 * 18;
+
+	// Read per-frame offset maps from workers.
+	// Each map entry is 12 bytes: frame_number(u32) + byte_offset(u64, worker-relative).
+	// Accumulate worker byte sizes to convert to file-absolute offsets.
+	let seek_entries: []flac::seekpoint = alloc(
+		[flac::seekpoint { sample_number = 0, byte_offset = 0, frame_samples = 0 }...],
+		n_seekpoints) as []flac::seekpoint;
+	defer free(seek_entries);
+
+	// Build a flat array of (frame_number, absolute_byte_offset) from all workers.
+	let all_frame_offsets: [](u32, u64) = [];
+	defer free(all_frame_offsets);
+
+	let cumulative_bytes: u64 = 0;
+	for (let i = 0z; i < n_workers; i += 1) {
+		// Read this worker's map: entries of 12 bytes each.
+		const map_size = io::seek(map_fds[i], 0, io::whence::END)!: size;
+		io::seek(map_fds[i], 0, io::whence::SET)!;
+		const n_entries = map_size / 12;
+		let buf: [12]u8 = [0...];
+		for (let j = 0z; j < n_entries; j += 1) {
+			io::readall(map_fds[i], buf)!;
+			const frame_num =
+				(buf[0]: u32 << 24) | (buf[1]: u32 << 16) |
+				(buf[2]: u32 << 8)  |  buf[3]: u32;
+			const worker_offset =
+				(buf[4]: u64 << 56) | (buf[5]: u64 << 48) |
+				(buf[6]: u64 << 40) | (buf[7]: u64 << 32) |
+				(buf[8]: u64 << 24) | (buf[9]: u64 << 16) |
+				(buf[10]: u64 << 8) |  buf[11]: u64;
+			append(all_frame_offsets,
+				(frame_num, header_size + cumulative_bytes + worker_offset))!;
+		};
+		// Accumulate this worker's total output size.
+		cumulative_bytes += io::seek(out_fds[i], 0, io::whence::END)!: u64;
+		io::seek(out_fds[i], 0, io::whence::SET)!;
+		io::close(map_fds[i])!;
+	};
+
+	// Match each seekpoint's target sample to the nearest frame entry.
+	for (let sp = 0z; sp < n_seekpoints; sp += 1) {
+		const target_sample = (sp * seekpoint_interval): u64;
+		const target_frame  = (target_sample / MAX_BLOCK: u64): u32;
+		// Binary search would be ideal; linear scan is fine for N <= ~2000.
+		let best_frame = 0u32;
+		let best_offset = header_size;
+		for (let k = 0z; k < len(all_frame_offsets); k += 1) {
+			const frame_num = all_frame_offsets[k].0;
+			const abs_offset = all_frame_offsets[k].1;
+			if (frame_num <= target_frame && frame_num >= best_frame) {
+				best_frame  = frame_num;
+				best_offset = abs_offset;
+			};
+		};
+		seek_entries[sp].sample_number = best_frame: u64 * MAX_BLOCK: u64;
+		seek_entries[sp].byte_offset   = best_offset;
+		seek_entries[sp].frame_samples = MAX_BLOCK: u16;
+	};
 
 	for (let i = 0z; i < n_workers; i += 1) {
 		io::seek(out_fds[i], 0, io::whence::SET)!;
@@ -201,7 +277,10 @@ export fn main() void = {
 		io::close(out_fds[i])!;
 	};
 
-	fmt::printfln("Encoded {} frames in {}.{}{}s", total_frames, elapsed_s,
+	// Seek back and write the real seektable.
+	flac::write_seektable(out_file, seektable_offset, seek_entries)!;
+
+	fmt::printfln("Encoded in {}.{}{}s", elapsed_s,
 		if (elapsed_ms < 10) "00" else if (elapsed_ms < 100) "0" else "",
 		elapsed_ms)!;
 };
@@ -238,14 +317,16 @@ fn run_worker(args: []str) void = {
 	const n_samples = file_size / 4;
 	const samples   = (ptr: *[*]i32)[..n_samples];
 
+	const map_file = io::fdopen(WORKER_MAP_FD);
 	let writer = flac::newwriter(out_file);
-	encode_chunk(&writer, samples, channels, bps, sample_rate, start_frame);
+	encode_chunk(&writer, map_file, samples, channels, bps, sample_rate, start_frame);
 };
 
 // encode_chunk encodes samples into raw FLAC frames (no STREAMINFO header).
 // start_frame is the absolute frame number for correct frame headers.
 fn encode_chunk(
 	writer: *flac::bit_writer,
+	map_file: io::file,
 	all_samples: []i32,
 	channels: size,
 	bps: u8,
@@ -312,6 +393,8 @@ fn encode_chunk(
 			ch1_samples[..block_size] = right[..block_size];
 		};
 
+		// Record this frame's byte offset before writing it.
+		const frame_byte_offset = flac::writer_pos(writer);
 		flac::reset_crc16(writer);
 		flac::write_frame_header_ext(
 			writer,
@@ -330,6 +413,21 @@ fn encode_chunk(
 		const frame_crc = flac::finalize_frame(writer);
 		flac::write_bits(writer, frame_crc: u64, 16)!;
 
+		// Write frame map entry: frame_number(4 bytes BE) + byte_offset(8 bytes BE).
+		let map_entry: [12]u8 = [0...];
+		map_entry[0] = ((frame_count >> 24) & 0xFF): u8;
+		map_entry[1] = ((frame_count >> 16) & 0xFF): u8;
+		map_entry[2] = ((frame_count >> 8)  & 0xFF): u8;
+		map_entry[3] = ( frame_count        & 0xFF): u8;
+		map_entry[4]  = ((frame_byte_offset >> 56) & 0xFF): u8;
+		map_entry[5]  = ((frame_byte_offset >> 48) & 0xFF): u8;
+		map_entry[6]  = ((frame_byte_offset >> 40) & 0xFF): u8;
+		map_entry[7]  = ((frame_byte_offset >> 32) & 0xFF): u8;
+		map_entry[8]  = ((frame_byte_offset >> 24) & 0xFF): u8;
+		map_entry[9]  = ((frame_byte_offset >> 16) & 0xFF): u8;
+		map_entry[10] = ((frame_byte_offset >> 8)  & 0xFF): u8;
+		map_entry[11] = ( frame_byte_offset        & 0xFF): u8;
+		io::writeall(map_file, map_entry)!;
 		frame_count += 1;
 		pos += block_samples;
 	};

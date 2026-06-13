@@ -1,8 +1,8 @@
 # hare-flac
 
-- A native Hare implementation of the FLAC (Free Lossless Audio Codec) specification. This project focuses on reconstruction using Linear Predictive Coding (LPC).
+- A native Hare implementation of the FLAC (Free Lossless Audio Codec) specification.
 - Works with 16bit & 24bit audio. Supports various sample rates.
-- Verified lossless audio compression via an MD5 check. 
+- Verified lossless encoding/decoding via an MD5 check. 
 
 ## Features
 
@@ -33,28 +33,33 @@ ln -s ~/path/to/hare-lpc/src/lpc vendor/lpc
 
 ### Running Tests
 
-Execute the test suite to verify autocorrelation, predictor logic, and Levinson-Durbin stability. The repo is still under construction, therefore the test suite should be expected to change drastically & may not currently cover enough:
+Execute the test suite to verify autocorrelation, predictor logic, and Levinson-Durbin stability. 
+The repo is still under construction, therefore the test suite should be expected to change 
+drastically & doesn't currently cover enough:
 
 ```bash
 hare test
 
 ```
 
-### Building flac-enc
+### Building flac-enc & flac-dec
 
-To build the flac encoder (converts a .wav to .flac):
+To build the flac encoder & decoder:
 
 ```bash
 make
-
 ```
-And to use the resulting binary:
+And to use the resulting binaries:
 
 ```bash
 ./flac-enc example.wav output.flac
 ```
-... note this is expecting use of the provided Nix derivation which creates the proper environment & sets the required $HAREPATH. If you don't plan on using Nix for environment management, ensure your $HAREPATH is properly set to include the stdlib, src dir and vendor dir.
 
+or:
+
+```bash
+./flac-dec example.flac output.wav
+```
 
 ## Implementation Details
 
@@ -74,3 +79,7 @@ The recent changes surrounding multi-processing are experimental, though I haven
 any issues yet. Compression ratios are comparable to libFLAC & ffmpeg (within ~2% on average, 
 though some tracks compress to an equal size). Depending on core count, encoding speeds are comparable, 
 notably at 32 workers a 7 minute track encodes in less than a second (9950X CPU).
+
+FLAC decoding is the least tested bit of code as things stand. Decoding has been made into a separate
+binary for now to keep concerns isolated. The multi-process design is currently functional & rather
+quick on a 16 core CPU, though needs further testing to ensure no breaking cases.
